@@ -1066,6 +1066,56 @@ async function actionNearbyFriendJoin(event, body) {
   });
 }
 
+async function actionNearbyGameCreate(event, body) {
+  const { playerId } = await requirePlayer(body);
+  const room = await actionRoomCreate(event, body);
+  const code = nearbyCode();
+  const expiresAt = now() + CFG.nearbyTtlMs;
+
+  await kvPut({
+    pk: `nearbyGame:${code}`,
+    type: 'nearbyGame',
+    owner: playerId,
+    expiresAt,
+    data: {
+      code,
+      gameId: sanitizeId(body.gameId || 'war_hearts'),
+      fromPlayerId: playerId,
+      roomId: room.roomId,
+      roomSecret: room.roomSecret,
+      createdAt: now(),
+      expiresAt
+    }
+  });
+
+  return {
+    ok: true,
+    code,
+    gameId: sanitizeId(body.gameId || 'war_hearts'),
+    roomId: room.roomId,
+    roomSecret: room.roomSecret,
+    expiresAt
+  };
+}
+
+async function actionNearbyGameJoin(event, body) {
+  await requirePlayer(body);
+  const code = safe(body.code || '').replace(/\D/g, '').slice(0, 6);
+  if (!code) throw new Error('nearby_game_code_required');
+
+  const row = await kvGet(`nearbyGame:${code}`);
+  const data = payload(row);
+  if (!row || !data.roomId || !data.roomSecret) return { ok: false, reason: 'nearby_game_not_found' };
+
+  return {
+    ok: true,
+    gameId: sanitizeId(data.gameId || 'war_hearts'),
+    roomId: data.roomId,
+    roomSecret: data.roomSecret,
+    expiresAt: data.expiresAt
+  };
+}
+
 const ACTIONS = {
   player_register: actionPlayerRegister,
   presence_heartbeat: actionHeartbeat,
@@ -1097,6 +1147,8 @@ const ACTIONS = {
   webpush_unsubscribe: actionWebPushUnsubscribe,
   nearby_friend_create: actionNearbyFriendCreate,
   nearby_friend_join: actionNearbyFriendJoin,
+  nearby_game_create: actionNearbyGameCreate,
+  nearby_game_join: actionNearbyGameJoin,
 
   // ===== FRIENDS MODULE (Phase A) =====
   profile_set: actionProfileSet,
