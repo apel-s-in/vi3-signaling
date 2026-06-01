@@ -27,6 +27,7 @@ const CFG = {
     .filter(Boolean),
   turnUsername: safe(process.env.TURN_USERNAME || ''),
   turnCredential: safe(process.env.TURN_CREDENTIAL || ''),
+  turnDisabled: safe(process.env.TURN_DISABLED || '1') === '1',
   webPushFunctionUrl: safe(process.env.WEBPUSH_FUNCTION_URL || ''),
   webPushSecret: safe(process.env.WEBPUSH_SECRET || '')
 };
@@ -965,7 +966,9 @@ async function actionRtcConfig(event, body) {
     { urls: 'stun:stun.cloudflare.com:3478' }
   ];
 
-  if (CFG.turnUrls.length && CFG.turnUsername && CFG.turnCredential) {
+  const hasTurn = !CFG.turnDisabled && !!(CFG.turnUrls.length && CFG.turnUsername && CFG.turnCredential);
+
+  if (hasTurn) {
     iceServers.unshift({
       urls: CFG.turnUrls,
       username: CFG.turnUsername,
@@ -976,9 +979,9 @@ async function actionRtcConfig(event, body) {
   return {
     ok: true,
     iceServers,
-    hasTurn: !!(CFG.turnUrls.length && CFG.turnUsername && CFG.turnCredential)
+    hasTurn,
+    turnDisabled: CFG.turnDisabled
   };
-}
 
 async function actionWebPushConfig(event, body) {
   return {
@@ -1068,7 +1071,21 @@ async function actionNearbyFriendJoin(event, body) {
 
 async function actionNearbyGameCreate(event, body) {
   const { playerId } = await requirePlayer(body);
-  const room = await actionRoomCreate(event, body);
+  const gameId = sanitizeId(body.gameId || 'war_hearts');
+  let roomId = sanitizeId(body.roomId || '');
+  let roomSecret = safe(body.roomSecret || body.secret || body.key || '');
+
+  if (roomId && roomSecret) {
+    const row = await kvGet(`room:${roomId}`);
+    const room = payload(row);
+    if (!row || room.roomSecretHash !== hash(roomSecret)) return { ok: false, reason: 'room_not_found' };
+    if (room.hostPlayerId !== playerId) return { ok: false, reason: 'room_owner_forbidden' };
+  } else {
+    const room = await actionRoomCreate(event, body);
+    roomId = room.roomId;
+    roomSecret = room.roomSecret;
+  }
+
   const code = nearbyCode();
   const expiresAt = now() + CFG.nearbyTtlMs;
 
@@ -1079,10 +1096,10 @@ async function actionNearbyGameCreate(event, body) {
     expiresAt,
     data: {
       code,
-      gameId: sanitizeId(body.gameId || 'war_hearts'),
+      gameId,
       fromPlayerId: playerId,
-      roomId: room.roomId,
-      roomSecret: room.roomSecret,
+      roomId,
+      roomSecret,
       createdAt: now(),
       expiresAt
     }
@@ -1091,9 +1108,9 @@ async function actionNearbyGameCreate(event, body) {
   return {
     ok: true,
     code,
-    gameId: sanitizeId(body.gameId || 'war_hearts'),
-    roomId: room.roomId,
-    roomSecret: room.roomSecret,
+    gameId,
+    roomId,
+    roomSecret,
     expiresAt
   };
 }
