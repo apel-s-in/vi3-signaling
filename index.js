@@ -82,6 +82,7 @@ function parseBody(event) {
 function corsHeaders(event) {
   const h = event.headers || {};
   const origin = safe(h.origin || h.Origin || '');
+  const reqHeaders = safe(h['access-control-request-headers'] || h['Access-Control-Request-Headers'] || '');
   let allow = '*';
 
   if (origin === 'null') {
@@ -97,7 +98,7 @@ function corsHeaders(event) {
   return {
     'Access-Control-Allow-Origin': allow,
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Accept, Authorization, X-Requested-With, X-Vi3-Player, X-Vi3-Secret',
+    'Access-Control-Allow-Headers': reqHeaders || 'Content-Type, Accept, Authorization, X-Requested-With, X-Vi3-Player, X-Vi3-Secret, X-Vi3-Admin',
     'Access-Control-Max-Age': '86400',
     'Vary': 'Origin'
   };
@@ -982,6 +983,7 @@ async function actionRtcConfig(event, body) {
     hasTurn,
     turnDisabled: CFG.turnDisabled
   };
+}
 
 async function actionWebPushConfig(event, body) {
   return {
@@ -1180,7 +1182,8 @@ const ACTIONS = {
 };
 
 exports.handler = async event => {
-  if (event.httpMethod === 'OPTIONS') return { statusCode: 200, headers: corsHeaders(event), body: '' };
+  const method = safe(event.httpMethod || event.requestContext?.http?.method || event.requestContext?.httpMethod || '').toUpperCase();
+  if (method === 'OPTIONS') return { statusCode: 200, headers: corsHeaders(event), body: '' };
 
   const body = parseBody(event);
   const action = safe(body.action || body.mode || event.queryStringParameters?.action || event.queryStringParameters?.mode || 'ping');
@@ -1192,6 +1195,10 @@ exports.handler = async event => {
         service: 'vi3-signaling',
         ydbConfigured: !!(CFG.endpoint && CFG.database),
         table: TABLE,
+        actions: Object.keys(ACTIONS).length,
+        turnDisabled: CFG.turnDisabled,
+        webPushConfigured: !!(CFG.webPushFunctionUrl && CFG.webPushSecret),
+        vapidPublicConfigured: !!CFG.vapidPublicKey,
         ts: now()
       });
     }
