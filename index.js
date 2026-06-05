@@ -538,6 +538,42 @@ async function actionRoomClose(event, body) {
   return { ok: true, closed: true };
 }
 
+async function actionRoomSetMode(event, body) {
+  const { playerId } = await requirePlayer(body);
+  const roomId = sanitizeId(body.roomId);
+  const roomSecret = safe(body.roomSecret || body.secret || body.key || '');
+  const row = roomId ? await kvGet(`room:${roomId}`) : null;
+  const room = payload(row);
+
+  if (!row || room.roomSecretHash !== hash(roomSecret)) return { ok: false, reason: 'room_not_found' };
+  if (![room.hostPlayerId, room.guestPlayerId].filter(Boolean).includes(playerId)) return { ok: false, reason: 'room_forbidden' };
+  if (room.status === 'closed') return { ok: false, reason: 'room_closed' };
+
+  const ranked = body.ranked === true;
+  room.ranked = ranked;
+  room.matchMode = ranked ? 'ranked' : 'casual';
+  room.localOnly = body.localOnly === false ? !!room.localOnly : true;
+  room.modeChangedByPlayerId = playerId;
+  room.modeChangedAt = now();
+  room.updatedAt = now();
+
+  await kvPut({
+    pk: `room:${roomId}`,
+    type: 'room',
+    owner: room.hostPlayerId || playerId,
+    expiresAt: room.reconnectUntil || now() + CFG.roomTtlMs,
+    data: room
+  });
+
+  return {
+    ok: true,
+    roomId,
+    ranked: !!room.ranked,
+    localOnly: !!room.localOnly,
+    matchMode: room.matchMode
+  };
+}
+
 async function actionSignalSend(event, body) {
   const { playerId } = await requirePlayer(body);
   const roomId = sanitizeId(body.roomId);
@@ -1255,6 +1291,7 @@ const ACTIONS = {
   room_get: actionRoomGet,
   room_close: actionRoomClose,
   room_delete: actionRoomClose,
+  room_set_mode: actionRoomSetMode,
   signal_send: actionSignalSend,
   signal_poll: actionSignalPoll,
   send_signal: actionSignalSend,
