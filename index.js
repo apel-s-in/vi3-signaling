@@ -1136,30 +1136,39 @@ async function actionNearbyGameJoin(event, body) {
 }
 // ─── LAN Wi-Fi: регистрация и разрешение кодов комнат ───────────────────────
 async function actionLanCodeRegister(event, body) {
-const { playerId } = await requirePlayer(body);
-const code = safe(body.code || '').replace(/[^A-Za-z0-9]/g, '').toUpperCase().slice(0, 6);
-const roomId = sanitizeId(body.roomId);
-const roomSecret = safe(body.roomSecret);
-if (!code || code.length < 4) throw new Error('lan_code_required');
-if (!roomId || !roomSecret) throw new Error('room_data_required');
-const ttlMs = Math.min(600000, Math.max(60000, num(body.ttlMs, 300000)));
-const expiresAt = now() + ttlMs;
-await kvPut({
-pk: `lanCode:${code}`,
-type: 'lanCode',
-owner: playerId,
-expiresAt,
-data: {
-code,
-roomId,
-roomSecret,
-ranked: !!body.ranked,
-hostPlayerId: playerId,
-createdAt: now(),
-expiresAt
-}
-});
-return { ok: true, code, expiresAt };
+  const { playerId } = await requirePlayer(body);
+  const code = safe(body.code || '').replace(/[^A-Za-z0-9]/g, '').toUpperCase().slice(0, 6);
+  const roomId = sanitizeId(body.roomId);
+  const roomSecret = safe(body.roomSecret);
+
+  if (!code || code.length < 4) throw new Error('lan_code_required');
+  if (!roomId || !roomSecret) throw new Error('room_data_required');
+
+  const row = await kvGet(`room:${roomId}`);
+  const room = payload(row);
+  if (!row || room.roomSecretHash !== hash(roomSecret)) return { ok: false, reason: 'room_not_found' };
+  if (room.hostPlayerId !== playerId) return { ok: false, reason: 'room_owner_forbidden' };
+
+  const ttlMs = Math.min(600000, Math.max(60000, num(body.ttlMs, 300000)));
+  const expiresAt = now() + ttlMs;
+
+  await kvPut({
+    pk: `lanCode:${code}`,
+    type: 'lanCode',
+    owner: playerId,
+    expiresAt,
+    data: {
+      code,
+      roomId,
+      roomSecret,
+      ranked: !!body.ranked,
+      hostPlayerId: playerId,
+      createdAt: now(),
+      expiresAt
+    }
+  });
+
+  return { ok: true, code, expiresAt };
 }
 
 async function actionLanCodeResolve(event, body) {
