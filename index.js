@@ -503,7 +503,17 @@ async function actionRoomJoin(event, body) {
 
   await kvPut({ pk: `room:${roomId}`, type: 'room', owner: room.hostPlayerId, expiresAt: room.reconnectUntil, data: room });
 
-  return { ok: true, roomId, roomSecret, hostPeerId: room.hostPeerId, guestPeerId: room.guestPeerId, room };
+  return {
+    ok: true,
+    roomId,
+    roomSecret,
+    hostPeerId: room.hostPeerId,
+    guestPeerId: room.guestPeerId,
+    ranked: !!room.ranked,
+    localOnly: !!room.localOnly,
+    matchMode: safe(room.matchMode || (room.ranked ? 'ranked' : 'casual')),
+    room
+  };
 }
 
 async function actionRoomGet(event, body) {
@@ -910,37 +920,65 @@ async function actionChatPoll(event, body) {
 async function actionMatchSubmit(event, body) {
   const { playerId } = await requirePlayer(body);
   const matchId = sanitizeId(body.matchId || rid('match'));
+  const roomId = sanitizeId(body.roomId || '');
   const expiresAt = 0;
+
+  let rankedAllowed = false;
+  let room = null;
+
+  if (roomId) {
+    const roomRow = await kvGet(`room:${roomId}`);
+    room = payload(roomRow);
+    rankedAllowed = !!roomRow
+      && !!room.ranked
+      && [room.hostPlayerId, room.guestPlayerId].includes(playerId);
+  }
+
+  const requestedRanked = body.ranked === true || body.result?.ranked === true;
+  const ranked = requestedRanked && rankedAllowed;
+
   const data = {
     matchId,
     gameId: sanitizeId(body.gameId || ''),
-    roomId: sanitizeId(body.roomId || ''),
+    roomId,
     playerId,
+    ranked,
+    localOnly: !!room?.localOnly,
+    matchMode: ranked ? 'ranked' : 'casual',
     result: body.result || {},
     resultHash: safe(body.resultHash || ''),
     transcriptHash: safe(body.transcriptHash || ''),
     createdAt: now()
   };
 
-  await kvPut({ pk: `match:${matchId}`, type: 'match', owner: playerId, expiresAt, data });
+  await kvPut({ pk: `match:${matchId}:${playerId}`, type: 'match', owner: playerId, expiresAt, data });
 
-  // Обновляем публичный профиль (рейтинг)
+  if (!ranked) {
+    return {
+      ok: true,
+      matchId,
+      ranked: false,
+      rated: false,
+      reason: rankedAllowed ? 'casual_match_not_rated' : 'room_not_ranked_or_forbidden'
+    };
+  }
+
   const pRow = await kvGet(`profile:${playerId}`);
-  const pData = payload(pRow) || { 
-    friendId: playerId, 
+  const pData = payload(pRow) || {
+    friendId: playerId,
     displayName: safe(body.displayName || 'Игрок').slice(0, 80),
     avatarUrl: ''
   };
-  
+
   const isWin = body.result?.status === 'win';
-  pData.rating = (pData.rating || 1000) + (isWin ? 25 : -15);
+  pData.rating = Math.max(100, (pData.rating || 1000) + (isWin ? 25 : -15));
   pData.wins = (pData.wins || 0) + (isWin ? 1 : 0);
   pData.matches = (pData.matches || 0) + 1;
   pData.updatedAt = now();
-  
+
   await kvPut({ pk: `profile:${playerId}`, type: 'profile', owner: playerId, data: pData });
 
-  return { ok: true, matchId };
+  return { ok: true, matchId, ranked: true, rated: true };
 }
 
 async function actionLeaderboardGet(event, body) {
@@ -1149,8 +1187,21 @@ async function actionLanCodeRegister(event, body) {
   if (!row || room.roomSecretHash !== hash(roomSecret)) return { ok: false, reason: 'room_not_found' };
   if (room.hostPlayerId !== playerId) return { ok: false, reason: 'room_owner_forbidden' };
 
+  room.ranked = !!body.ranked;
+  room.localOnly = true;
+  room.matchMode = room.ranked ? 'ranked' : 'casual';
+  room.updatedAt = now();
+
   const ttlMs = Math.min(600000, Math.max(60000, num(body.ttlMs, 300000)));
   const expiresAt = now() + ttlMs;
+
+  await kvPut({
+    pk: `room:${roomId}`,
+    type: 'room',
+    owner: room.hostPlayerId || playerId,
+    expiresAt: room.reconnectUntil || expiresAt,
+    data: room
+  });
 
   await kvPut({
     pk: `lanCode:${code}`,
@@ -1179,12 +1230,15 @@ const row = await kvGet(`lanCode:${code}`);
 const data = payload(row);
 if (!row || !data.roomId || !data.roomSecret) return { ok: false, reason: 'lan_room_not_found' };
 return {
-ok: true,
-code: data.code,
-roomId: data.roomId,
-roomSecret: data.roomSecret,
-ranked: !!data.ranked,
-hostPlayerId: data.hostPlayerId
+  ok: true,
+  code: data.code,
+  roomId: data.roomId,
+  roomSecret: data.roomSecret,
+  ranked: !!data.ranked,
+  localOnly: true,
+  matchMode: data.ranked ? 'ranked' : 'casual',
+  hostPlayerId: data.hostPlayerId,
+  expiresAt: data.expiresAt
 };
 }
 const ACTIONS = {
