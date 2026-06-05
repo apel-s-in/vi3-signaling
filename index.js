@@ -1134,7 +1134,50 @@ async function actionNearbyGameJoin(event, body) {
     expiresAt: data.expiresAt
   };
 }
+// ─── LAN Wi-Fi: регистрация и разрешение кодов комнат ───────────────────────
+async function actionLanCodeRegister(event, body) {
+const { playerId } = await requirePlayer(body);
+const code = safe(body.code || '').replace(/[^A-Za-z0-9]/g, '').toUpperCase().slice(0, 6);
+const roomId = sanitizeId(body.roomId);
+const roomSecret = safe(body.roomSecret);
+if (!code || code.length < 4) throw new Error('lan_code_required');
+if (!roomId || !roomSecret) throw new Error('room_data_required');
+const ttlMs = Math.min(600000, Math.max(60000, num(body.ttlMs, 300000)));
+const expiresAt = now() + ttlMs;
+await kvPut({
+pk: `lanCode:${code}`,
+type: 'lanCode',
+owner: playerId,
+expiresAt,
+data: {
+code,
+roomId,
+roomSecret,
+ranked: !!body.ranked,
+hostPlayerId: playerId,
+createdAt: now(),
+expiresAt
+}
+});
+return { ok: true, code, expiresAt };
+}
 
+async function actionLanCodeResolve(event, body) {
+await requirePlayer(body);
+const code = safe(body.code || '').replace(/[^A-Za-z0-9]/g, '').toUpperCase().slice(0, 6);
+if (!code) throw new Error('lan_code_required');
+const row = await kvGet(`lanCode:${code}`);
+const data = payload(row);
+if (!row || !data.roomId || !data.roomSecret) return { ok: false, reason: 'lan_room_not_found' };
+return {
+ok: true,
+code: data.code,
+roomId: data.roomId,
+roomSecret: data.roomSecret,
+ranked: !!data.ranked,
+hostPlayerId: data.hostPlayerId
+};
+}
 const ACTIONS = {
   player_register: actionPlayerRegister,
   presence_heartbeat: actionHeartbeat,
@@ -1168,6 +1211,8 @@ const ACTIONS = {
   nearby_friend_join: actionNearbyFriendJoin,
   nearby_game_create: actionNearbyGameCreate,
   nearby_game_join: actionNearbyGameJoin,
+  lan_code_register: actionLanCodeRegister,
+  lan_code_resolve: actionLanCodeResolve,
 
   // ===== FRIENDS MODULE (Phase A) =====
   profile_set: actionProfileSet,
