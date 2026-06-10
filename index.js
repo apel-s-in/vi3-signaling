@@ -1211,7 +1211,7 @@ async function actionNearbyGameJoin(event, body) {
 // ─── LAN Wi-Fi: регистрация и разрешение кодов комнат ───────────────────────
 async function actionLanCodeRegister(event, body) {
   const { playerId } = await requirePlayer(body);
-  const code = safe(body.code || '').replace(/[^A-Za-z0-9]/g, '').toUpperCase().slice(0, 6);
+  const code = safe(body.code || '').replace(/\D/g, '').slice(0, 6);
   const roomId = sanitizeId(body.roomId);
   const roomSecret = safe(body.roomSecret);
 
@@ -1224,7 +1224,9 @@ async function actionLanCodeRegister(event, body) {
   if (room.hostPlayerId !== playerId) return { ok: false, reason: 'room_owner_forbidden' };
 
   room.ranked = !!body.ranked;
-  room.localOnly = true;
+  // localOnly больше не форсируем: гость не должен получать урезанный ICE.
+  // LAN-режим — это просто способ обмена кодом, а не запрет STUN.
+  room.localOnly = false;
   room.matchMode = room.ranked ? 'ranked' : 'casual';
   room.updatedAt = now();
 
@@ -1260,7 +1262,7 @@ async function actionLanCodeRegister(event, body) {
 
 async function actionLanCodeResolve(event, body) {
 await requirePlayer(body);
-const code = safe(body.code || '').replace(/[^A-Za-z0-9]/g, '').toUpperCase().slice(0, 6);
+const code = safe(body.code || '').replace(/\D/g, '').slice(0, 6);
 if (!code) throw new Error('lan_code_required');
 const row = await kvGet(`lanCode:${code}`);
 const data = payload(row);
@@ -1271,7 +1273,7 @@ return {
   roomId: data.roomId,
   roomSecret: data.roomSecret,
   ranked: !!data.ranked,
-  localOnly: true,
+  localOnly: false,
   matchMode: data.ranked ? 'ranked' : 'casual',
   hostPlayerId: data.hostPlayerId,
   expiresAt: data.expiresAt
