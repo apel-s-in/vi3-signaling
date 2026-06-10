@@ -930,7 +930,7 @@ async function actionChatSend(event, body) {
     body: text,
     url: './?openFriends=1',
     tag: `chat-${chatRoomId(playerId, toFriendId)}`,
-    requireInteraction: false
+    requireInteraction: true
   });
 
   return { ok: true, msgId, createdAt, webPush };
