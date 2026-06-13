@@ -1032,6 +1032,181 @@ async function actionChatDelivered(event, body) {
 async function actionChatRead(event, body) {
   return actionChatReceipt(event, body, 'read');
 }
+
+async function saveVoiceLog({ callId, fromPlayerId, toPlayerId, roomId, status, startedAt = 0, endedAt = 0, durationSec = 0 } = {}) {
+  const room = chatRoomId(fromPlayerId, toPlayerId);
+  const at = now();
+  const oldRow = callId ? await kvGet(`voice:${room}:${callId}`) : null;
+  const old = payload(oldRow);
+
+  const data = {
+    ...old,
+    callId,
+    room,
+    roomId,
+    fromPlayerId,
+    toPlayerId,
+    status: safe(status || old.status || 'created'),
+    createdAt: old.createdAt || at,
+    startedAt: startedAt || old.startedAt || 0,
+    endedAt: endedAt || old.endedAt || 0,
+    durationSec: durationSec || old.durationSec || 0,
+    updatedAt: at
+  };
+
+  await kvPut({
+    pk: `voice:${room}:${callId}`,
+    type: 'voice',
+    owner: room,
+    expiresAt: at + 90 * 24 * 60 * 60 * 1000,
+    data
+  });
+
+  return data;
+}
+
+async function actionVoiceHistory(event, body) {
+  const { playerId } = await requirePlayer(body);
+  const friendId = sanitizeId(body.friendId || body.withFriendId);
+  if (!friendId) throw new Error('friend_required');
+
+  const room = chatRoomId(playerId, friendId);
+  const rows = await kvPrefix(`voice:${room}:`, 100);
+  const items = rows
+    .map(payload)
+    .sort((a, b) => num(a.createdAt) - num(b.createdAt))
+    .slice(-50);
+
+  return { ok: true, items };
+}
+
+async function actionVoiceCallCreate(event, body) {
+  const { playerId } = await requirePlayer(body);
+  const toFriendId = sanitizeId(body.toFriendId || body.friendId);
+  if (!toFriendId) throw new Error('to_friend_required');
+
+  const peerId = sanitizeId(body.peerId || `${playerId}:voice:${rid('p')}`, 140);
+  const roomRes = await actionRoomCreate(event, {
+    ...body,
+    gameId: 'voice_call',
+    peerId
+  });
+
+  const callId = rid('voice');
+  await saveVoiceLog({
+    callId,
+    fromPlayerId: playerId,
+    toPlayerId: toFriendId,
+    roomId: roomRes.roomId,
+    status: 'ringing'
+  });
+
+  await kvPut({
+    pk: `push:${toFriendId}:${now().toString().padStart(13, '0')}_${callId}`,
+    type: 'push',
+    owner: toFriendId,
+    expiresAt: now() + 2 * 60 * 1000,
+    data: {
+      pushId: callId,
+      callId,
+      fromFriendId: playerId,
+      kind: 'VOICE_CALL',
+      roomId: roomRes.roomId,
+      roomSecret: roomRes.roomSecret,
+      createdAt: now(),
+      expiresAt: now() + 2 * 60 * 1000
+    }
+  }).catch(() => null);
+
+  const profile = payload(await kvGet(`profile:${playerId}`));
+  const fromName = safe(profile.displayName || body.displayName || 'Друг').slice(0, 80);
+
+  const webPush = await sendSystemWebPush({
+    toPlayerId: toFriendId,
+    title: '📞 Входящий звонок',
+    body: `Пользователь ${fromName} звонит вам`,
+    url: `./?openFriends=1&voiceWith=${encodeURIComponent(playerId)}&voiceRoom=${encodeURIComponent(roomRes.roomId)}&key=${encodeURIComponent(roomRes.roomSecret)}&callId=${encodeURIComponent(callId)}`,
+    tag: `voice-${roomRes.roomId}`,
+    requireInteraction: true,
+    kind: 'VOICE_CALL',
+    fromFriendId: playerId,
+    roomId: roomRes.roomId
+  });
+
+  return {
+    ok: true,
+    callId,
+    roomId: roomRes.roomId,
+    roomSecret: roomRes.roomSecret,
+    hostPeerId: roomRes.hostPeerId,
+    guestPeerId: roomRes.guestPeerId,
+    webPush
+  };
+}
+
+async function actionVoiceCallJoin(event, body) {
+  const { playerId } = await requirePlayer(body);
+  const friendId = sanitizeId(body.friendId || body.fromFriendId);
+  const callId = sanitizeId(body.callId || '', 96);
+  const roomId = sanitizeId(body.roomId);
+  const roomSecret = safe(body.roomSecret || body.secret || body.key || '');
+  const peerId = sanitizeId(body.peerId || `${playerId}:voice:${rid('p')}`, 140);
+  if (!friendId) throw new Error('friend_required');
+
+  const joined = await actionRoomJoin(event, {
+    ...body,
+    roomId,
+    roomSecret,
+    peerId
+  });
+
+  if (callId) {
+    await saveVoiceLog({
+      callId,
+      fromPlayerId: friendId,
+      toPlayerId: playerId,
+      roomId,
+      status: 'connected',
+      startedAt: now()
+    });
+  }
+
+  return {
+    ok: true,
+    callId,
+    roomId,
+    roomSecret,
+    hostPeerId: joined.hostPeerId,
+    guestPeerId: joined.guestPeerId,
+    room: joined.room
+  };
+}
+
+async function actionVoiceCallEnd(event, body) {
+  const { playerId } = await requirePlayer(body);
+  const friendId = sanitizeId(body.friendId || body.withFriendId);
+  const callId = sanitizeId(body.callId || '', 96);
+  const roomId = sanitizeId(body.roomId);
+  const status = sanitizeId(body.status || 'ended', 40);
+  const durationSec = num(body.durationSec, 0);
+
+  if (roomId) await actionRoomClose(event, { ...body, roomId }).catch(() => null);
+
+  if (friendId && callId) {
+    await saveVoiceLog({
+      callId,
+      fromPlayerId: body.fromFriendId ? sanitizeId(body.fromFriendId) : friendId,
+      toPlayerId: body.toFriendId ? sanitizeId(body.toFriendId) : playerId,
+      roomId,
+      status,
+      endedAt: now(),
+      durationSec
+    }).catch(() => null);
+  }
+
+  return { ok: true };
+}
+
 async function actionMatchSubmit(event, body) {
   const { playerId } = await requirePlayer(body);
   const matchId = sanitizeId(body.matchId || rid('match'));
@@ -1407,7 +1582,11 @@ const ACTIONS = {
   chat_poll: actionChatPoll,
   chat_clear: actionChatClear,
   chat_delivery: actionChatDelivered,
-  chat_read: actionChatRead
+  chat_read: actionChatRead,
+  voice_history: actionVoiceHistory,
+  voice_call_create: actionVoiceCallCreate,
+  voice_call_join: actionVoiceCallJoin,
+  voice_call_end: actionVoiceCallEnd
 };
 
 exports.handler = async event => {
