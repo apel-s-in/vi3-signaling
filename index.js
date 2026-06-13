@@ -781,7 +781,7 @@ async function actionPresenceBatch(event, body) {
   return { ok: true, presence };
 }
 
-async function sendSystemWebPush({ toPlayerId, title, body, url = './', tag = 'vi3-notification', requireInteraction = false, kind = '', fromFriendId = '', gameId = '', roomId = '' } = {}) {
+async function sendSystemWebPush({ toPlayerId, title, body, url = './', tag = 'vi3-notification', requireInteraction = false, kind = '', fromFriendId = '', gameId = '', roomId = '', msgId = '' } = {}) {
   if (!CFG.webPushFunctionUrl || !CFG.webPushSecret || !toPlayerId) return { ok: false, skipped: true };
 
   try {
@@ -803,7 +803,8 @@ async function sendSystemWebPush({ toPlayerId, title, body, url = './', tag = 'v
         kind,
         fromFriendId,
         gameId,
-        roomId
+        roomId,
+        msgId
       })
     });
 
@@ -903,7 +904,9 @@ async function actionChatSend(event, body) {
     fromFriendId: playerId,
     toFriendId,
     text,
-    createdAt
+    createdAt,
+    deliveredAt: 0,
+    readAt: 0
   };
 
   await kvPut({
@@ -942,7 +945,8 @@ async function actionChatSend(event, body) {
     tag: `chat-${chatRoomId(playerId, toFriendId)}`,
     requireInteraction: true,
     kind: 'CHAT_MESSAGE',
-    fromFriendId: playerId
+    fromFriendId: playerId,
+    msgId
   });
 
   return { ok: true, msgId, createdAt, webPush };
@@ -976,7 +980,56 @@ async function actionChatClear(event, body) {
 
   return { ok: true, cleared: rows.length };
 }
+async function actionChatReceipt(event, body, receiptKind) {
+  const { playerId } = await requirePlayer(body);
+  const friendId = sanitizeId(body.friendId || body.withFriendId);
+  const msgId = sanitizeId(body.msgId || '', 96);
+  if (!friendId) throw new Error('friend_required');
 
+  const room = chatRoomId(playerId, friendId);
+  const rows = await kvPrefix(`chat:${room}:`, 300);
+  const at = now();
+  let updated = 0;
+
+  for (const row of rows) {
+    const msg = payload(row);
+    if (!msg || msg.fromFriendId !== friendId || msg.toFriendId !== playerId) continue;
+    if (msgId && msg.msgId !== msgId) continue;
+
+    if (receiptKind === 'delivered') {
+      if (msg.deliveredAt) continue;
+      msg.deliveredAt = at;
+    }
+
+    if (receiptKind === 'read') {
+      if (msg.readAt) continue;
+      msg.deliveredAt = msg.deliveredAt || at;
+      msg.readAt = at;
+    }
+
+    msg.updatedAt = at;
+    await kvPut({
+      pk: row.pk,
+      type: 'chat',
+      owner: room,
+      expiresAt: num(row.expires_at) || (num(msg.createdAt) + 30 * 24 * 60 * 60 * 1000),
+      data: msg
+    });
+
+    updated++;
+    if (msgId) break;
+  }
+
+  return { ok: true, updated, at };
+}
+
+async function actionChatDelivered(event, body) {
+  return actionChatReceipt(event, body, 'delivered');
+}
+
+async function actionChatRead(event, body) {
+  return actionChatReceipt(event, body, 'read');
+}
 async function actionMatchSubmit(event, body) {
   const { playerId } = await requirePlayer(body);
   const matchId = sanitizeId(body.matchId || rid('match'));
@@ -1350,7 +1403,9 @@ const ACTIONS = {
   push_poll: actionPushPoll,
   chat_send: actionChatSend,
   chat_poll: actionChatPoll,
-  chat_clear: actionChatClear
+  chat_clear: actionChatClear,
+  chat_delivery: actionChatDelivered,
+  chat_read: actionChatRead
 };
 
 exports.handler = async event => {
