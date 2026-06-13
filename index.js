@@ -781,7 +781,7 @@ async function actionPresenceBatch(event, body) {
   return { ok: true, presence };
 }
 
-async function sendSystemWebPush({ toPlayerId, title, body, url = './', tag = 'vi3-notification', requireInteraction = false } = {}) {
+async function sendSystemWebPush({ toPlayerId, title, body, url = './', tag = 'vi3-notification', requireInteraction = false, kind = '', fromFriendId = '', gameId = '', roomId = '' } = {}) {
   if (!CFG.webPushFunctionUrl || !CFG.webPushSecret || !toPlayerId) return { ok: false, skipped: true };
 
   try {
@@ -799,7 +799,11 @@ async function sendSystemWebPush({ toPlayerId, title, body, url = './', tag = 'v
         body,
         url,
         tag,
-        requireInteraction
+        requireInteraction,
+        kind,
+        fromFriendId,
+        gameId,
+        roomId
       })
     });
 
@@ -849,13 +853,19 @@ async function actionPushSend(event, body) {
 
   const webPush = await sendSystemWebPush({
     toPlayerId: toFriendId,
-    title: kind === 'GAME_INVITE' ? '🎮 Вызов на дуэль' : '🔔 Витрина Разбита',
-    body: kind === 'GAME_INVITE' ? `${fromName} приглашает в Войну Сердец` : (text || `${fromName} отправил уведомление`),
+    title: kind === 'GAME_INVITE' ? '🎮 Приглашение в приложение' : '🔔 Витрина Разбита',
+    body: kind === 'GAME_INVITE'
+      ? `Ваш друг "${fromName}" приглашает вас в приложение`
+      : (text || `${fromName} отправил уведомление`),
     url: kind === 'GAME_INVITE' && gameId && roomId && roomSecret
       ? `./?gcGame=${encodeURIComponent(gameId)}&room=${encodeURIComponent(roomId)}&key=${encodeURIComponent(roomSecret)}`
-      : './',
+      : './?openFriends=1',
     tag: kind === 'GAME_INVITE' ? `game-${roomId || pushId}` : `push-${pushId}`,
-    requireInteraction: kind === 'GAME_INVITE'
+    requireInteraction: kind === 'GAME_INVITE',
+    kind,
+    fromFriendId: playerId,
+    gameId,
+    roomId
   });
 
   return { ok: true, pushId, webPush };
@@ -926,11 +936,13 @@ async function actionChatSend(event, body) {
 
   const webPush = await sendSystemWebPush({
     toPlayerId: toFriendId,
-    title: `💬 ${fromName}`,
+    title: `💬 Новое сообщение от ${fromName}`,
     body: text,
-    url: './?openFriends=1',
+    url: `./?openFriends=1&chatWith=${encodeURIComponent(playerId)}`,
     tag: `chat-${chatRoomId(playerId, toFriendId)}`,
-    requireInteraction: true
+    requireInteraction: true,
+    kind: 'CHAT_MESSAGE',
+    fromFriendId: playerId
   });
 
   return { ok: true, msgId, createdAt, webPush };
@@ -951,6 +963,18 @@ async function actionChatPoll(event, body) {
     .slice(-80);
 
   return { ok: true, items };
+}
+
+async function actionChatClear(event, body) {
+  const { playerId } = await requirePlayer(body);
+  const friendId = sanitizeId(body.friendId || body.withFriendId);
+  if (!friendId) throw new Error('friend_required');
+
+  const room = chatRoomId(playerId, friendId);
+  const rows = await kvPrefix(`chat:${room}:`, 300);
+  await Promise.all(rows.map(r => kvDelete(r.pk).catch(() => null)));
+
+  return { ok: true, cleared: rows.length };
 }
 
 async function actionMatchSubmit(event, body) {
@@ -1325,7 +1349,8 @@ const ACTIONS = {
   push_send: actionPushSend,
   push_poll: actionPushPoll,
   chat_send: actionChatSend,
-  chat_poll: actionChatPoll
+  chat_poll: actionChatPoll,
+  chat_clear: actionChatClear
 };
 
 exports.handler = async event => {
