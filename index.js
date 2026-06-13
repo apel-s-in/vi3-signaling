@@ -926,6 +926,7 @@ async function actionChatSend(event, body) {
     expiresAt: createdAt + 7 * 24 * 60 * 60 * 1000,
     data: {
       pushId: chatPushId,
+      msgId,
       fromFriendId: playerId,
       kind: 'CHAT_MESSAGE',
       text,
@@ -959,10 +960,10 @@ async function actionChatPoll(event, body) {
   if (!friendId) throw new Error('friend_required');
 
   const room = chatRoomId(playerId, friendId);
-  const rows = await kvPrefix(`chat:${room}:`, 120);
+  const rows = await kvPrefix(`chat:${room}:`, 300);
   const items = rows
     .map(payload)
-    .filter(x => num(x.createdAt) > after)
+    .filter(x => Math.max(num(x.createdAt), num(x.updatedAt)) > after)
     .sort((a, b) => num(a.createdAt) - num(b.createdAt))
     .slice(-80);
 
