@@ -491,11 +491,15 @@ async function actionRoomJoin(event, body) {
 
   if (!row || room.roomSecretHash !== hash(roomSecret)) return { ok: false, reason: 'room_not_found' };
 
+  const requestedPeerId = sanitizeId(body.peerId || '', 120);
   if (room.guestPlayerId && room.guestPlayerId !== playerId) {
     return { ok: false, reason: 'room_already_has_guest' };
   }
 
-  const requestedPeerId = sanitizeId(body.peerId || '', 120);
+  if (room.guestPlayerId === playerId && room.guestPeerId && requestedPeerId && room.guestPeerId !== requestedPeerId) {
+    return { ok: false, reason: 'room_busy' };
+  }
+
   room.guestPlayerId = playerId;
   room.guestPeerId = requestedPeerId || sanitizeId(room.guestPeerId || `${roomId}:guest`, 120) || `${roomId}:guest`;
   room.status = room.status === 'waiting' ? 'accepted' : room.status;
@@ -1157,12 +1161,20 @@ async function actionVoiceCallJoin(event, body) {
   const peerId = sanitizeId(body.peerId || `${playerId}:voice:${rid('p')}`, 140);
   if (!friendId) throw new Error('friend_required');
 
+  if (callId) {
+    const logRow = await kvGet(`voice:${chatRoomId(friendId, playerId)}:${callId}`);
+    const log = payload(logRow);
+    if (log?.status === 'connected') return { ok: false, reason: 'voice_busy' };
+  }
+
   const joined = await actionRoomJoin(event, {
     ...body,
     roomId,
     roomSecret,
     peerId
   });
+
+  if (!joined?.ok) return joined;
 
   if (callId) {
     await saveVoiceLog({
