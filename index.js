@@ -852,17 +852,18 @@ async function actionPushSend(event, body) {
   const profile = payload(await kvGet(`profile:${playerId}`));
   const fromName = safe(profile.displayName || body.displayName || 'Друг').slice(0, 80);
 
+  const isGameInvite = kind === 'GAME_INVITE';
   const webPush = await sendSystemWebPush({
     toPlayerId: toFriendId,
-    title: kind === 'GAME_INVITE' ? '🎮 Приглашение в приложение' : '🔔 Витрина Разбита',
-    body: kind === 'GAME_INVITE'
-      ? `Ваш друг "${fromName}" приглашает вас в приложение`
-      : (text || `${fromName} отправил уведомление`),
-    url: kind === 'GAME_INVITE' && gameId && roomId && roomSecret
+    title: isGameInvite ? '🎮 Приглашение в игру' : '🔔 Приглашение в приложение',
+    body: isGameInvite
+      ? `Пользователь ${fromName} приглашает вас в игру Война Сердец`
+      : `Пользователь ${fromName} приглашает вас в приложение`,
+    url: isGameInvite && gameId && roomId && roomSecret
       ? `./?gcGame=${encodeURIComponent(gameId)}&room=${encodeURIComponent(roomId)}&key=${encodeURIComponent(roomSecret)}`
       : './?openFriends=1',
-    tag: kind === 'GAME_INVITE' ? `game-${roomId || pushId}` : `push-${pushId}`,
-    requireInteraction: kind === 'GAME_INVITE',
+    tag: isGameInvite ? `game-${roomId || pushId}` : `push-${pushId}`,
+    requireInteraction: true,
     kind,
     fromFriendId: playerId,
     gameId,
@@ -940,8 +941,8 @@ async function actionChatSend(event, body) {
 
   const webPush = await sendSystemWebPush({
     toPlayerId: toFriendId,
-    title: `💬 Новое сообщение от ${fromName}`,
-    body: text,
+    title: '💬 Новое сообщение',
+    body: `Пользователь ${fromName} прислал вам сообщение`,
     url: `./?openFriends=1&chatWith=${encodeURIComponent(playerId)}`,
     tag: `chat-${chatRoomId(playerId, toFriendId)}`,
     requireInteraction: true,
