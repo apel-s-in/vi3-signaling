@@ -781,7 +781,7 @@ async function actionPresenceBatch(event, body) {
   return { ok: true, presence };
 }
 
-async function sendSystemWebPush({ toPlayerId, title, body, url = './', tag = 'vi3-notification', requireInteraction = false, kind = '', fromFriendId = '', gameId = '', roomId = '', msgId = '' } = {}) {
+async function sendSystemWebPush({ toPlayerId, title, body, url = './', tag = 'vi3-notification', requireInteraction = false, kind = '', fromFriendId = '', gameId = '', roomId = '', roomSecret = '', msgId = '', callId = '' } = {}) {
   if (!CFG.webPushFunctionUrl || !CFG.webPushSecret || !toPlayerId) return { ok: false, skipped: true };
 
   try {
@@ -804,7 +804,9 @@ async function sendSystemWebPush({ toPlayerId, title, body, url = './', tag = 'v
         fromFriendId,
         gameId,
         roomId,
-        msgId
+        roomSecret,
+        msgId,
+        callId
       })
     });
 
@@ -1130,7 +1132,9 @@ async function actionVoiceCallCreate(event, body) {
     requireInteraction: true,
     kind: 'VOICE_CALL',
     fromFriendId: playerId,
-    roomId: roomRes.roomId
+    roomId: roomRes.roomId,
+    roomSecret: roomRes.roomSecret,
+    callId
   });
 
   return {
