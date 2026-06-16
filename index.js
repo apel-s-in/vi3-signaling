@@ -911,6 +911,9 @@ async function actionChatSend(event, body) {
     fromFriendId: playerId,
     toFriendId,
     text,
+    replyToMsgId: sanitizeId(body.replyToMsgId || '', 96),
+    replyText: safe(body.replyText || '').slice(0, 160),
+    reactions: {},
     createdAt,
     deliveredAt: 0,
     readAt: 0
@@ -1037,6 +1040,65 @@ async function actionChatDelivered(event, body) {
 
 async function actionChatRead(event, body) {
   return actionChatReceipt(event, body, 'read');
+}
+
+async function actionChatDelete(event, body) {
+  const { playerId } = await requirePlayer(body);
+  const friendId = sanitizeId(body.friendId || body.withFriendId);
+  const msgId = sanitizeId(body.msgId || '', 96);
+  if (!friendId) throw new Error('friend_required');
+  if (!msgId) throw new Error('msg_required');
+
+  const room = chatRoomId(playerId, friendId);
+  const rows = await kvPrefix(`chat:${room}:`, 300);
+  let deleted = 0;
+
+  for (const row of rows) {
+    const msg = payload(row);
+    if (msg?.msgId !== msgId) continue;
+    await kvDelete(row.pk).catch(() => null);
+    deleted++;
+    break;
+  }
+
+  return { ok: true, deleted };
+}
+
+async function actionChatReact(event, body) {
+  const { playerId } = await requirePlayer(body);
+  const friendId = sanitizeId(body.friendId || body.withFriendId);
+  const msgId = sanitizeId(body.msgId || '', 96);
+  const emoji = safe(body.emoji || '').slice(0, 8);
+  if (!friendId) throw new Error('friend_required');
+  if (!msgId) throw new Error('msg_required');
+
+  const room = chatRoomId(playerId, friendId);
+  const rows = await kvPrefix(`chat:${room}:`, 300);
+  const at = now();
+  let updated = 0;
+
+  for (const row of rows) {
+    const msg = payload(row);
+    if (msg?.msgId !== msgId) continue;
+
+    msg.reactions = msg.reactions && typeof msg.reactions === 'object' ? msg.reactions : {};
+    if (emoji) msg.reactions[playerId] = emoji;
+    else delete msg.reactions[playerId];
+
+    msg.updatedAt = at;
+    await kvPut({
+      pk: row.pk,
+      type: 'chat',
+      owner: room,
+      expiresAt: num(row.expires_at) || (num(msg.createdAt) + 30 * 24 * 60 * 60 * 1000),
+      data: msg
+    });
+
+    updated++;
+    break;
+  }
+
+  return { ok: true, updated, at };
 }
 
 async function saveVoiceLog({ callId, fromPlayerId, toPlayerId, roomId, status, startedAt = 0, endedAt = 0, durationSec = 0 } = {}) {
@@ -1599,6 +1661,8 @@ const ACTIONS = {
   chat_clear: actionChatClear,
   chat_delivery: actionChatDelivered,
   chat_read: actionChatRead,
+  chat_delete: actionChatDelete,
+  chat_react: actionChatReact,
   voice_history: actionVoiceHistory,
   voice_call_create: actionVoiceCallCreate,
   voice_call_join: actionVoiceCallJoin,
