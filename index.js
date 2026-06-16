@@ -1702,7 +1702,9 @@ exports.handler = async event => {
     return reply(event, 200, await fn(event, body));
   } catch (e) {
     const msg = safe(e.message || 'server_error');
-    const status = /required|bad_|forbidden|not_found/.test(msg) ? 400 : 500;
+    const status = /RESOURCE_EXHAUSTED|resource_exhausted|Too many|overload/i.test(msg)
+      ? 429
+      : (/required|bad_|forbidden|not_found/.test(msg) ? 400 : 500);
     return reply(event, status, { ok: false, error: msg });
   }
 };
