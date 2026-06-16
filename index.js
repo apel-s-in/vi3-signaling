@@ -490,6 +490,8 @@ async function actionRoomJoin(event, body) {
   const room = payload(row);
 
   if (!row || room.roomSecretHash !== hash(roomSecret)) return { ok: false, reason: 'room_not_found' };
+  if (room.status === 'closed' || num(room.closedAt) > 0) return { ok: false, reason: 'room_closed' };
+  if (num(room.reconnectUntil) > 0 && num(room.reconnectUntil) < now()) return { ok: false, reason: 'room_expired' };
 
   const requestedPeerId = sanitizeId(body.peerId || '', 120);
   if (room.guestPlayerId && room.guestPlayerId !== playerId) {
@@ -590,6 +592,7 @@ async function actionSignalSend(event, body) {
   const roomRow = roomId ? await kvGet(`room:${roomId}`) : null;
   const room = payload(roomRow);
   if (!roomRow || room.roomSecretHash !== hash(roomSecret)) return { ok: false, reason: 'room_not_found' };
+  if (room.status === 'closed' || num(room.closedAt) > 0) return { ok: false, reason: 'room_closed' };
   if (!toPeerId || !fromPeerId || !type) throw new Error('bad_signal');
 
   const seq = `${now().toString().padStart(13, '0')}_${crypto.randomBytes(4).toString('hex')}`;
@@ -624,6 +627,7 @@ async function actionSignalPoll(event, body) {
   const roomRow = roomId ? await kvGet(`room:${roomId}`) : null;
   const room = payload(roomRow);
   if (!roomRow || room.roomSecretHash !== hash(roomSecret)) return { ok: false, reason: 'room_not_found' };
+  if (room.status === 'closed' || num(room.closedAt) > 0) return { ok: false, reason: 'room_closed' };
   if (!peerId) throw new Error('peer_id_required');
 
   const rows = await kvPrefix(`signal:${roomId}:${peerId}:`, 200);
@@ -828,14 +832,15 @@ async function actionPushSend(event, body) {
   if (!toFriendId) throw new Error('to_friend_required');
 
   const pushId = rid('push');
-  const expiresAt = now() + 7 * 24 * 60 * 60 * 1000;
-
   const kind = safe(body.kind || 'GENERIC').slice(0, 40);
   const gameId = sanitizeId(body.gameId || '');
   const roomId = sanitizeId(body.roomId || '');
   const roomSecret = safe(body.roomSecret || '');
   const text = safe(body.text || '').slice(0, 300);
   const createdAt = now();
+  const expiresAt = kind === 'GAME_INVITE'
+    ? createdAt + Math.max(30000, Math.min(CFG.gameInviteTtlMs || 30000, 120000))
+    : createdAt + 7 * 24 * 60 * 60 * 1000;
 
   await kvPut({
     pk: `push:${toFriendId}:${createdAt.toString().padStart(13, '0')}_${pushId}`,
@@ -873,7 +878,8 @@ async function actionPushSend(event, body) {
     kind,
     fromFriendId: playerId,
     gameId,
-    roomId
+    roomId,
+    roomSecret
   });
 
   return { ok: true, pushId, webPush };
@@ -883,7 +889,18 @@ async function actionPushPoll(event, body) {
   const { playerId } = await requirePlayer(body);
 
   const rows = await kvPrefix(`push:${playerId}:`, 100);
-  const items = rows.map(payload).sort((a, b) => num(a.createdAt) - num(b.createdAt));
+  const t = now();
+  const items = rows
+    .map(payload)
+    .filter(x => {
+      const exp = num(x.expiresAt);
+      const age = t - num(x.createdAt);
+      if (exp && exp < t) return false;
+      if (x.kind === 'GAME_INVITE' && age > 120000) return false;
+      if (x.kind === 'VOICE_CALL' && age > 120000) return false;
+      return true;
+    })
+    .sort((a, b) => num(a.createdAt) - num(b.createdAt));
 
   await Promise.all(rows.map(r => kvDelete(r.pk).catch(() => null)));
 
@@ -907,6 +924,7 @@ async function actionChatSend(event, body) {
 
   const msg = {
     msgId,
+    clientMsgId: sanitizeId(body.clientMsgId || '', 96),
     room,
     fromFriendId: playerId,
     toFriendId,
@@ -960,7 +978,7 @@ async function actionChatSend(event, body) {
     msgId
   });
 
-  return { ok: true, msgId, createdAt, webPush };
+  return { ok: true, msgId, clientMsgId: msg.clientMsgId, createdAt, webPush };
 }
 
 async function actionChatPoll(event, body) {
@@ -1076,16 +1094,33 @@ async function actionChatReact(event, body) {
   const rows = await kvPrefix(`chat:${room}:`, 300);
   const at = now();
   let updated = 0;
+  let reactions = {};
 
   for (const row of rows) {
     const msg = payload(row);
     if (msg?.msgId !== msgId) continue;
 
     msg.reactions = msg.reactions && typeof msg.reactions === 'object' ? msg.reactions : {};
-    if (emoji) msg.reactions[playerId] = emoji;
+    let mine = msg.reactions[playerId];
+
+    if (typeof mine === 'string') mine = mine ? [mine] : [];
+    if (!Array.isArray(mine)) mine = [];
+    mine = mine.map(x => safe(x).slice(0, 8)).filter(Boolean).slice(0, 3);
+
+    if (emoji) {
+      mine = mine.includes(emoji)
+        ? mine.filter(x => x !== emoji)
+        : [...mine, emoji].slice(-3);
+    } else {
+      mine = [];
+    }
+
+    if (mine.length) msg.reactions[playerId] = mine;
     else delete msg.reactions[playerId];
 
     msg.updatedAt = at;
+    reactions = msg.reactions;
+
     await kvPut({
       pk: row.pk,
       type: 'chat',
@@ -1098,7 +1133,7 @@ async function actionChatReact(event, body) {
     break;
   }
 
-  return { ok: true, updated, at };
+  return { ok: true, updated, at, reactions };
 }
 
 async function saveVoiceLog({ callId, fromPlayerId, toPlayerId, roomId, status, startedAt = 0, endedAt = 0, durationSec = 0 } = {}) {
