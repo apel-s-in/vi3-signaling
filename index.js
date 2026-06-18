@@ -914,7 +914,7 @@ function chatRoomId(a, b) {
 async function actionChatSend(event, body) {
   const { playerId } = await requirePlayer(body);
   const toFriendId = sanitizeId(body.toFriendId || body.friendId);
-  const text = safe(body.text || '').slice(0, 500);
+  const text = safe(body.text || '').slice(0, 1000);
   if (!toFriendId) throw new Error('to_friend_required');
   if (!text) throw new Error('text_required');
 
