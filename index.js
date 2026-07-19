@@ -785,7 +785,9 @@ async function actionRoomSetMode(event, body) {
   const room = payload(row);
 
   if (!row || room.roomSecretHash !== hash(roomSecret)) return { ok: false, reason: 'room_not_found' };
-  if (![room.hostPlayerId, room.guestPlayerId].filter(Boolean).includes(playerId)) return { ok: false, reason: 'room_forbidden' };
+  if (room.hostPlayerId !== playerId) {
+    return { ok: false, reason: 'room_host_required' };
+  }
   if (room.status === 'closed') return { ok: false, reason: 'room_closed' };
 
   const ranked = body.ranked === true;
@@ -1120,24 +1122,68 @@ async function actionPushSend(event, body) {
 
 async function actionPushPoll(event, body) {
   const { playerId } = await requirePlayer(event, body);
-
   const rows = await kvPrefix(`push:${playerId}:`, 100);
   const t = now();
-  const items = rows
-    .map(payload)
-    .filter(x => {
-      const exp = num(x.expiresAt);
-      const age = t - num(x.createdAt);
-      if (exp && exp < t) return false;
-      if (x.kind === 'GAME_INVITE' && age > 120000) return false;
-      if (x.kind === 'VOICE_CALL' && age > 120000) return false;
-      return true;
-    })
-    .sort((a, b) => num(a.createdAt) - num(b.createdAt));
+  const items = [];
 
-  await Promise.all(rows.map(r => kvDelete(r.pk).catch(() => null)));
+  for (const row of rows) {
+    const item = payload(row);
+    const exp = num(item.expiresAt);
+    const age = t - num(item.createdAt);
 
+    const stale =
+      (exp && exp < t) ||
+      (item.kind === 'GAME_INVITE' && age > 120000) ||
+      (item.kind === 'VOICE_CALL' && age > 120000);
+
+    if (stale) {
+      await kvDelete(row.pk).catch(() => null);
+      continue;
+    }
+
+    if (!item.deliveredAt) {
+      item.status = 'delivered';
+      item.deliveredAt = t;
+      item.deliveryAttempts = num(item.deliveryAttempts) + 1;
+
+      await kvPut({
+        pk: row.pk,
+        type: 'push',
+        owner: playerId,
+        expiresAt: num(row.expires_at) || num(item.expiresAt),
+        data: item
+      });
+    }
+
+    items.push(item);
+  }
+
+  items.sort((a, b) => num(a.createdAt) - num(b.createdAt));
   return { ok: true, items };
+}
+
+async function actionPushAck(event, body) {
+  const { playerId } = await requirePlayer(event, body);
+  const ids = new Set(
+    (Array.isArray(body.pushIds) ? body.pushIds : [body.pushId])
+      .map(x => sanitizeId(x, 120))
+      .filter(Boolean)
+      .slice(0, 100)
+  );
+
+  if (!ids.size) return { ok: true, acked: 0 };
+
+  const rows = await kvPrefix(`push:${playerId}:`, 100);
+  let acked = 0;
+
+  for (const row of rows) {
+    const item = payload(row);
+    if (!ids.has(sanitizeId(item.pushId, 120))) continue;
+    await kvDelete(row.pk).catch(() => null);
+    acked++;
+  }
+
+  return { ok: true, acked };
 }
 
 function chatRoomId(a, b) {
@@ -1918,6 +1964,7 @@ const ACTIONS = {
   nearby_game_join: actionNearbyGameJoin,
   lan_code_register: actionLanCodeRegister,
   lan_code_resolve: actionLanCodeResolve,
+  push_ack: actionPushAck,
 
   // ===== FRIENDS MODULE (Phase A) =====
   profile_set: actionProfileSet,
