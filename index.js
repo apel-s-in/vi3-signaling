@@ -385,6 +385,55 @@ async function kvPut({ pk, type = '', owner = '', expiresAt = 0, data = {} }) {
   return true;
 }
 
+async function kvCompareAndPut({
+  row,
+  type = '',
+  owner = '',
+  expiresAt = 0,
+  data = {}
+}) {
+  if (!row?.pk) throw new Error('cas_row_required');
+
+  const expectedUpdatedAt = num(row.updated_at);
+  const nextUpdatedAt = Math.max(now(), expectedUpdatedAt + 1);
+  const mutationId = rid('cas');
+  const nextData = {
+    ...data,
+    _lastMutationId: mutationId
+  };
+
+  await query(`
+    DECLARE $pk AS Utf8;
+    DECLARE $expected_updated_at AS Uint64;
+    DECLARE $type AS Utf8;
+    DECLARE $owner AS Utf8;
+    DECLARE $next_updated_at AS Uint64;
+    DECLARE $expires_at AS Uint64;
+    DECLARE $payload_json AS Utf8;
+
+    UPDATE ${TABLE}
+    SET
+      type = $type,
+      owner = $owner,
+      updated_at = $next_updated_at,
+      expires_at = $expires_at,
+      payload_json = $payload_json
+    WHERE pk = $pk
+      AND updated_at = $expected_updated_at;
+  `, {
+    '$pk': tvUtf8(row.pk),
+    '$expected_updated_at': tvUint64(expectedUpdatedAt),
+    '$type': tvUtf8(type),
+    '$owner': tvUtf8(owner),
+    '$next_updated_at': tvUint64(nextUpdatedAt),
+    '$expires_at': tvUint64(expiresAt),
+    '$payload_json': tvUtf8(JSON.stringify(nextData))
+  });
+
+  const check = await kvGet(row.pk);
+  return payload(check)?._lastMutationId === mutationId;
+}
+
 async function kvDelete(pk) {
   await query(`
     DECLARE $pk AS Utf8;
@@ -1676,6 +1725,12 @@ function validateCryptoAad({
 
   return aad;
 }
+  const expectedRevision = Math.max(1, num(body.expectedRevision));
+  if (num(msg.revision, 1) !== expectedRevision) {
+    const error = new Error('chat_revision_conflict');
+    error.httpStatus = 409;
+    throw error;
+  }
 
 async function validateCryptoPack({
   pack,
@@ -1990,6 +2045,7 @@ async function actionChatSendV2(event, body) {
     toFriendId,
     cryptoVersion: 2,
     crypto: cryptoPack,
+    revision: 1,
     createdAt,
     updatedAt: createdAt,
     deliveredAt: 0,
@@ -2310,7 +2366,12 @@ async function actionChatUpdateV2(event, body) {
   } = await requireChatMessageContext(event, body, {
     cryptoVersion: 2
   });
-
+  const expectedRevision = Math.max(1, num(body.expectedRevision));
+  if (num(msg.revision, 1) !== expectedRevision) {
+    const error = new Error('chat_revision_conflict');
+    error.httpStatus = 409;
+    throw error;
+  }
   msg.crypto = await validateCryptoPack({
     pack: body.crypto,
     playerId,
@@ -2320,10 +2381,11 @@ async function actionChatUpdateV2(event, body) {
     clientMsgId: body.crypto?.clientMsgId,
     subjectMsgId: msg.msgId
   });
+  msg.revision = expectedRevision + 1;
   msg.updatedAt = now();
 
-  await kvPut({
-    pk: row.pk,
+  const changed = await kvCompareAndPut({
+    row,
     type: 'chat',
     owner: room,
     expiresAt: num(row.expires_at) ||
@@ -2331,10 +2393,17 @@ async function actionChatUpdateV2(event, body) {
     data: msg
   });
 
+  if (!changed) {
+    const error = new Error('chat_revision_conflict');
+    error.httpStatus = 409;
+    throw error;
+  }
+
   return {
     ok: true,
     updated: 1,
     cryptoVersion: 2,
+    revision: msg.revision,
     at: msg.updatedAt
   };
 }
@@ -2364,8 +2433,12 @@ async function actionChatDeleteV2(event, body) {
   msg.deletedAt = Math.max(num(body.deletedAt), now());
   msg.updatedAt = msg.deletedAt;
 
-  await kvPut({
-    pk: row.pk,
+  msg.revision = expectedRevision + 1;
+  msg.deletedAt = Math.max(num(body.deletedAt), now());
+  msg.updatedAt = msg.deletedAt;
+
+  const changed = await kvCompareAndPut({
+    row,
     type: 'chat',
     owner: room,
     expiresAt: num(row.expires_at) ||
@@ -2373,10 +2446,17 @@ async function actionChatDeleteV2(event, body) {
     data: msg
   });
 
+  if (!changed) {
+    const error = new Error('chat_revision_conflict');
+    error.httpStatus = 409;
+    throw error;
+  }
+
   return {
     ok: true,
     deleted: 1,
     tombstone: true,
+    revision: msg.revision,
     cryptoVersion: 2,
     at: msg.deletedAt
   };
