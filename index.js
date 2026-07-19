@@ -703,9 +703,17 @@ async function actionRoomJoin(event, body) {
   const row = roomId ? await kvGet(`room:${roomId}`) : null;
   const room = payload(row);
 
-  if (!row || room.roomSecretHash !== hash(roomSecret)) return { ok: false, reason: 'room_not_found' };
-  if (room.status === 'closed' || num(room.closedAt) > 0) return { ok: false, reason: 'room_closed' };
-  if (num(room.reconnectUntil) > 0 && num(room.reconnectUntil) < now()) return { ok: false, reason: 'room_expired' };
+  if (!row || room.roomSecretHash !== hash(roomSecret)) {
+    return { ok: false, reason: 'room_not_found' };
+  }
+
+  if (room.status === 'closed' || num(room.closedAt) > 0) {
+    return { ok: false, reason: 'room_closed' };
+  }
+
+  if (num(room.reconnectUntil) > 0 && num(room.reconnectUntil) < now()) {
+    return { ok: false, reason: 'room_expired' };
+  }
 
   const requestedPeerId = sanitizeId(body.peerId || '', 120);
 
@@ -714,25 +722,37 @@ async function actionRoomJoin(event, body) {
     room.invitedPlayerId !== playerId &&
     room.hostPlayerId !== playerId
   ) {
-    return { ok: await requireFriendship(
-    playerId,
-    body.friendId || body.withFriendId
-  );
-  const msgId = sanitizeId(body.msgId || '', 96);
-  const emoji = safe(body.emoji || '').slice(0, 8);
+    return { ok: false, reason: 'room_invite_forbidden' };
+  }
+
+  if (room.guestPlayerId && room.guestPlayerId !== playerId) {
     return { ok: false, reason: 'room_already_has_guest' };
   }
 
-  if (room.guestPlayerId === playerId && room.guestPeerId && requestedPeerId && room.guestPeerId !== requestedPeerId) {
+  if (
+    room.guestPlayerId === playerId &&
+    room.guestPeerId &&
+    requestedPeerId &&
+    room.guestPeerId !== requestedPeerId
+  ) {
     return { ok: false, reason: 'room_busy' };
   }
 
   room.guestPlayerId = playerId;
-  room.guestPeerId = requestedPeerId || sanitizeId(room.guestPeerId || `${roomId}:guest`, 120) || `${roomId}:guest`;
+  room.guestPeerId =
+    requestedPeerId ||
+    sanitizeId(room.guestPeerId || `${roomId}:guest`, 120) ||
+    `${roomId}:guest`;
   room.status = room.status === 'waiting' ? 'accepted' : room.status;
   room.updatedAt = now();
 
-  await kvPut({ pk: `room:${roomId}`, type: 'room', owner: room.hostPlayerId, expiresAt: room.reconnectUntil, data: room });
+  await kvPut({
+    pk: `room:${roomId}`,
+    type: 'room',
+    owner: room.hostPlayerId,
+    expiresAt: room.reconnectUntil || now() + CFG.roomTtlMs,
+    data: room
+  });
 
   return {
     ok: true,
@@ -2286,6 +2306,8 @@ exports.handler = async event => {
         turnDisabled: CFG.turnDisabled,
         webPushConfigured: !!(CFG.webPushFunctionUrl && CFG.webPushSecret),
         vapidPublicConfigured: !!CFG.vapidPublicKey,
+        socialSessionConfigured: !!CFG.socialSessionSecret,
+        allowLegacyAuth: CFG.allowLegacyAuth,
         ts: now()
       });
     }
