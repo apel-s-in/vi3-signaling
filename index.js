@@ -1499,7 +1499,20 @@ async function deleteChatRowsThrough(room, cutoff, batchSize = 300, maxBatches =
     if (!targets.length) break;
 
     await Promise.all(
-      targets.map(row => kvDelete(row.pk).catch(() => null))
+      targets.flatMap(row => {
+        const message = payload(row);
+        return [
+          kvDelete(row.pk).catch(() => null),
+          message.msgId
+            ? kvDelete(`chatById:${room}:${message.msgId}`).catch(() => null)
+            : Promise.resolve(),
+          message.clientMsgId && message.fromFriendId
+            ? kvDelete(
+              `chatClient:${room}:${message.fromFriendId}:${message.clientMsgId}`
+            ).catch(() => null)
+            : Promise.resolve()
+        ];
+      })
     );
 
     deleted += targets.length;
@@ -1602,10 +1615,76 @@ function normalizeCryptoPack(raw) {
   };
 }
 
+function decodeCryptoAad(encoded) {
+  let data;
+
+  try {
+    data = JSON.parse(base64urlDecode(encoded).toString('utf8'));
+  } catch {
+    throw new Error('bad_crypto_aad');
+  }
+
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    throw new Error('bad_crypto_aad');
+  }
+
+  return {
+    v: num(data.v),
+    kind: sanitizeId(data.kind, 40),
+    room: safe(data.room),
+    fromFriendId: sanitizeId(data.fromFriendId),
+    toFriendId: sanitizeId(data.toFriendId),
+    clientMsgId: sanitizeId(data.clientMsgId, 120),
+    subjectMsgId: sanitizeId(data.subjectMsgId, 96),
+    senderDeviceId: sanitizeId(data.senderDeviceId, 120)
+  };
+}
+
+function validateCryptoAad({
+  pack,
+  room,
+  playerId,
+  friendId,
+  kind,
+  clientMsgId = '',
+  subjectMsgId = ''
+}) {
+  const aad = decodeCryptoAad(pack.aad);
+
+  if (aad.v !== 2) throw new Error('bad_crypto_aad_version');
+  if (aad.kind !== sanitizeId(kind, 40)) {
+    throw new Error('bad_crypto_aad_kind');
+  }
+  if (aad.room !== room) {
+    throw new Error('bad_crypto_aad_room');
+  }
+  if (aad.fromFriendId !== playerId) {
+    throw new Error('bad_crypto_aad_sender');
+  }
+  if (aad.toFriendId !== friendId) {
+    throw new Error('bad_crypto_aad_recipient');
+  }
+  if (aad.senderDeviceId !== pack.senderDeviceId) {
+    throw new Error('bad_crypto_aad_device');
+  }
+  if (aad.clientMsgId !== sanitizeId(clientMsgId || pack.clientMsgId, 120)) {
+    throw new Error('bad_crypto_aad_client_message');
+  }
+  if (aad.subjectMsgId !== sanitizeId(subjectMsgId, 96)) {
+    throw new Error('bad_crypto_aad_subject');
+  }
+
+  return aad;
+}
+
 async function validateCryptoPack({
   pack,
   playerId,
-  friendId
+  friendId,
+  room,
+  kind,
+  clientMsgId = '',
+  subjectMsgId = ''
 }) {
   const normalized = normalizeCryptoPack(pack);
   const senderDevices = await getCryptoDevices(playerId);
@@ -1650,6 +1729,30 @@ async function validateCryptoPack({
   ) {
     throw new Error('crypto_envelope_coverage_mismatch');
   }
+
+  const envelopeKeys = normalized.envelopes.map(item =>
+    `${item.ownerId}:${item.deviceId}`
+  );
+
+  if (new Set(envelopeKeys).size !== envelopeKeys.length) {
+    throw new Error('crypto_duplicate_envelope');
+  }
+
+  if (normalized.envelopes.some(item =>
+    item.ownerId !== playerId && item.ownerId !== friendId
+  )) {
+    throw new Error('crypto_foreign_envelope');
+  }
+
+  validateCryptoAad({
+    pack: normalized,
+    room,
+    playerId,
+    friendId,
+    kind,
+    clientMsgId,
+    subjectMsgId
+  });
 
   return normalized;
 }
@@ -1756,8 +1859,36 @@ async function actionCryptoDeviceRevoke(event, body) {
 }
 
 async function findChatRow(room, msgId) {
+  const indexRow = await kvGet(`chatById:${room}:${msgId}`);
+  const index = payload(indexRow);
+
+  if (index?.chatPk) {
+    const row = await kvGet(index.chatPk);
+    if (row && payload(row)?.msgId === msgId) return row;
+  }
+
+  // Временный fallback для сообщений, созданных до индекса.
   const rows = await kvPrefix(`chat:${room}:`, 300);
-  return rows.find(row => payload(row)?.msgId === msgId) || null;
+  const row = rows.find(item => payload(item)?.msgId === msgId) || null;
+
+  if (row) {
+    const message = payload(row);
+    await kvPut({
+      pk: `chatById:${room}:${msgId}`,
+      type: 'chatById',
+      owner: room,
+      expiresAt: num(row.expires_at),
+      data: {
+        room,
+        msgId,
+        chatPk: row.pk,
+        clientMsgId: safe(message.clientMsgId),
+        createdAt: num(message.createdAt)
+      }
+    }).catch(() => null);
+  }
+
+  return row;
 }
 
 async function requireChatMessageContext(event, body, {
@@ -1812,23 +1943,45 @@ async function actionChatSendV2(event, body) {
     friendFields: ['toFriendId', 'friendId']
   });
 
+  const requestedClientMsgId = sanitizeId(
+    body.clientMsgId || body.crypto?.clientMsgId,
+    120
+  );
+
   const cryptoPack = await validateCryptoPack({
     pack: body.crypto,
     playerId,
-    friendId: toFriendId
+    friendId: toFriendId,
+    room,
+    kind: 'message',
+    clientMsgId: requestedClientMsgId,
+    subjectMsgId: ''
   });
 
   const createdAt = now();
   const msgId = rid('chat');
-  const clientMsgId = sanitizeId(
-    body.clientMsgId || cryptoPack.clientMsgId,
-    120
-  );
+  const clientMsgId = requestedClientMsgId;
 
   if (!clientMsgId) {
     throw new Error('client_msg_id_required');
   }
 
+  const duplicateRow = await kvGet(
+    `chatClient:${room}:${playerId}:${clientMsgId}`
+  );
+  const duplicate = payload(duplicateRow);
+
+  if (duplicate?.msgId) {
+    return {
+      ok: true,
+      duplicate: true,
+      msgId: duplicate.msgId,
+      clientMsgId,
+      cryptoVersion: 2,
+      createdAt: num(duplicate.createdAt)
+    };
+  }
+  
   const msg = {
     msgId,
     clientMsgId,
@@ -1847,13 +2000,43 @@ async function actionChatSendV2(event, body) {
   const chatPk =
     `chat:${room}:${String(createdAt).padStart(13, '0')}:${msgId}`;
 
-  await kvPut({
-    pk: chatPk,
-    type: 'chat',
-    owner: room,
-    expiresAt: createdAt + 30 * 24 * 60 * 60 * 1000,
-    data: msg
-  });
+  const chatExpiresAt = createdAt + 30 * 24 * 60 * 60 * 1000;
+
+  await Promise.all([
+    kvPut({
+      pk: chatPk,
+      type: 'chat',
+      owner: room,
+      expiresAt: chatExpiresAt,
+      data: msg
+    }),
+    kvPut({
+      pk: `chatById:${room}:${msgId}`,
+      type: 'chatById',
+      owner: room,
+      expiresAt: chatExpiresAt,
+      data: {
+        room,
+        msgId,
+        chatPk,
+        clientMsgId,
+        createdAt
+      }
+    }),
+    kvPut({
+      pk: `chatClient:${room}:${playerId}:${clientMsgId}`,
+      type: 'chatClient',
+      owner: playerId,
+      expiresAt: chatExpiresAt,
+      data: {
+        room,
+        msgId,
+        chatPk,
+        clientMsgId,
+        createdAt
+      }
+    })
+  ]);
 
   const roomState = await getChatRoomState(room);
   if (roomState.purgeBefore >= createdAt) {
@@ -1968,6 +2151,29 @@ async function actionChatPoll(event, body) {
     .slice(-80);
 
   return { ok: true, items };
+}
+
+async function actionChatMessageGet(event, body) {
+  const {
+    playerId,
+    friendId,
+    room,
+    message
+  } = await requireChatMessageContext(event, body, {
+    cryptoVersion: 2
+  });
+
+  if (
+    ![message.fromFriendId, message.toFriendId].includes(playerId) ||
+    ![message.fromFriendId, message.toFriendId].includes(friendId)
+  ) {
+    throw new Error('chat_message_forbidden');
+  }
+
+  return {
+    ok: true,
+    message
+  };
 }
 
 async function actionChatClear(event, body) {
@@ -2108,7 +2314,11 @@ async function actionChatUpdateV2(event, body) {
   msg.crypto = await validateCryptoPack({
     pack: body.crypto,
     playerId,
-    friendId
+    friendId,
+    room,
+    kind: 'reaction',
+    clientMsgId: body.crypto?.clientMsgId,
+    subjectMsgId: msg.msgId
   });
   msg.updatedAt = now();
 
@@ -2145,7 +2355,11 @@ async function actionChatDeleteV2(event, body) {
   msg.crypto = await validateCryptoPack({
     pack: body.crypto,
     playerId,
-    friendId
+    friendId,
+    room,
+    kind: 'tombstone',
+    clientMsgId: body.crypto?.clientMsgId,
+    subjectMsgId: msg.msgId
   });
   msg.deletedAt = Math.max(num(body.deletedAt), now());
   msg.updatedAt = msg.deletedAt;
@@ -2838,6 +3052,7 @@ const ACTIONS = {
   chat_update_v2: actionChatUpdateV2,
   chat_delete_v2: actionChatDeleteV2,
   chat_poll: actionChatPoll,
+  chat_message_get: actionChatMessageGet,
   chat_clear: actionChatClear,
   chat_delivery: actionChatDelivered,
   chat_read: actionChatRead,
@@ -2885,14 +3100,20 @@ exports.handler = async event => {
     return reply(event, 200, await fn(event, body));
   } catch (e) {
     const msg = safe(e.message || 'server_error');
-    const status =
+    const explicitStatus = num(e?.httpStatus);
+    const status = explicitStatus || (
       /RESOURCE_EXHAUSTED|resource_exhausted|Too many|overload/i.test(msg)
         ? 429
         : (/social_session|yandex_oauth/.test(msg)
           ? 401
           : (/forbidden|identity_mismatch/.test(msg)
             ? 403
-            : (/required|bad_|not_found/.test(msg) ? 400 : 500)));
+            : (/chat_revision_conflict/.test(msg)
+              ? 409
+              : (/crypto_.*(?:missing|not_ready|conflict)|chat_e2ee_disabled/.test(msg)
+                ? 409
+                : (/required|bad_|not_found/.test(msg) ? 400 : 500))))
+    );
 
     return reply(event, status, { ok: false, error: msg });
   }
