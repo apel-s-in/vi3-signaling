@@ -700,11 +700,20 @@ async function actionRoomJoin(event, body) {
 }
 
 async function actionRoomGet(event, body) {
-  await requirePlayer(event, body);
+  const { playerId } = await requirePlayer(event, body);
   const roomId = sanitizeId(body.roomId);
+  const roomSecret = safe(body.roomSecret || body.secret || body.key || '');
   const row = roomId ? await kvGet(`room:${roomId}`) : null;
   const room = payload(row);
-  if (!row) return { ok: false, reason: 'room_not_found' };
+
+  if (!row || room.roomSecretHash !== hash(roomSecret)) {
+    return { ok: false, reason: 'room_not_found' };
+  }
+
+  if (!isRoomParticipant(room, playerId)) {
+    return { ok: false, reason: 'room_forbidden' };
+  }
+
   return { ok: true, room };
 }
 
