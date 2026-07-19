@@ -718,15 +718,33 @@ async function actionRoomGet(event, body) {
 }
 
 async function actionRoomClose(event, body) {
-  await requirePlayer(event, body);
+  const { playerId } = await requirePlayer(event, body);
   const roomId = sanitizeId(body.roomId);
+  const roomSecret = safe(body.roomSecret || body.secret || body.key || '');
   const row = roomId ? await kvGet(`room:${roomId}`) : null;
   const room = payload(row);
+
   if (!row) return { ok: true, closed: false };
+  if (room.roomSecretHash !== hash(roomSecret)) {
+    return { ok: false, reason: 'room_not_found' };
+  }
+  if (!isRoomParticipant(room, playerId)) {
+    return { ok: false, reason: 'room_forbidden' };
+  }
+
   room.status = 'closed';
   room.closedAt = now();
+  room.closedByPlayerId = playerId;
   room.updatedAt = now();
-  await kvPut({ pk: `room:${roomId}`, type: 'room', owner: room.hostPlayerId || '', expiresAt: now() + 600000, data: room });
+
+  await kvPut({
+    pk: `room:${roomId}`,
+    type: 'room',
+    owner: room.hostPlayerId || '',
+    expiresAt: now() + 600000,
+    data: room
+  });
+
   return { ok: true, closed: true };
 }
 
