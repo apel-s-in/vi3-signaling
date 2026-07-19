@@ -1913,6 +1913,59 @@ async function actionCryptoDeviceRevoke(event, body) {
   };
 }
 
+async function actionCryptoDeviceSelfList(event, body) {
+  const { playerId } = await requirePlayer(event, body);
+  const items = await getCryptoDevices(playerId, {
+    activeOnly: false
+  });
+
+  return {
+    ok: true,
+    items: items.map(item => ({
+      ownerId: item.ownerId,
+      deviceId: item.deviceId,
+      deviceStableId: item.deviceStableId || '',
+      publicJwk: item.publicJwk,
+      fingerprint: item.fingerprint,
+      label: item.label,
+      createdAt: item.createdAt,
+      updatedAt: item.updatedAt,
+      revokedAt: item.revokedAt || 0
+    }))
+  };
+}
+
+async function actionCryptoDeviceReset(event, body) {
+  const { playerId } = await requirePlayer(event, body);
+  const rows = await kvPrefix(`cryptoDevice:${playerId}:`, 100);
+  const at = now();
+  let revoked = 0;
+
+  for (const row of rows) {
+    const data = payload(row);
+    if (!data.deviceId || data.revokedAt) continue;
+
+    data.revokedAt = at;
+    data.updatedAt = at;
+
+    await kvPut({
+      pk: row.pk,
+      type: 'cryptoDevice',
+      owner: playerId,
+      data
+    });
+
+    revoked++;
+  }
+
+  return {
+    ok: true,
+    revoked,
+    resetAt: at,
+    historyReadable: false
+  };
+}
+
 async function findChatRow(room, msgId) {
   const indexRow = await kvGet(`chatById:${room}:${msgId}`);
   const index = payload(indexRow);
@@ -3115,7 +3168,9 @@ const ACTIONS = {
   signal_ack: actionSignalAck,
   crypto_device_register: actionCryptoDeviceRegister,
   crypto_device_list: actionCryptoDeviceList,
+  crypto_device_self_list: actionCryptoDeviceSelfList,
   crypto_device_revoke: actionCryptoDeviceRevoke,
+  crypto_device_reset: actionCryptoDeviceReset,
   chat_settings_get: actionChatSettingsGet,
   chat_settings_set: actionChatSettingsSet,
   chat_purge_both: actionChatPurgeBoth,
