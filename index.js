@@ -1188,8 +1188,10 @@ async function sendSystemWebPush({ toPlayerId, title, body, url = './', tag = 'v
 async function actionPushSend(event, body) {
   const { playerId } = await requirePlayer(event, body);
 
-  const toFriendId = sanitizeId(body.toFriendId || body.toPlayerId);
-  if (!toFriendId) throw new Error('to_friend_required');
+  const toFriendId = await requireFriendship(
+    playerId,
+    body.toFriendId || body.toPlayerId
+  );
 
   const pushId = rid('push');
   const kind = safe(body.kind || 'GENERIC').slice(0, 40);
@@ -1447,9 +1449,11 @@ async function actionChatSend(event, body) {
 
 async function actionChatPoll(event, body) {
   const { playerId } = await requirePlayer(event, body);
-  const friendId = sanitizeId(body.friendId || body.withFriendId);
+  const friendId = await requireFriendship(
+    playerId,
+    body.friendId || body.withFriendId
+  );
   const after = num(body.after, 0);
-  if (!friendId) throw new Error('friend_required');
 
   const room = chatRoomId(playerId, friendId);
   const pref = await getChatPreference(room, playerId);
@@ -1550,9 +1554,11 @@ async function actionChatPurgeBoth(event, body) {
 
 async function actionChatReceipt(event, body, receiptKind) {
   const { playerId } = await requirePlayer(event, body);
-  const friendId = sanitizeId(body.friendId || body.withFriendId);
+  const friendId = await requireFriendship(
+    playerId,
+    body.friendId || body.withFriendId
+  );
   const msgId = sanitizeId(body.msgId || '', 96);
-  if (!friendId) throw new Error('friend_required');
 
   const room = chatRoomId(playerId, friendId);
   const rows = await kvPrefix(`chat:${room}:`, 300);
@@ -1601,9 +1607,11 @@ async function actionChatRead(event, body) {
 
 async function actionChatDelete(event, body) {
   const { playerId } = await requirePlayer(event, body);
-  const friendId = sanitizeId(body.friendId || body.withFriendId);
+  const friendId = await requireFriendship(
+    playerId,
+    body.friendId || body.withFriendId
+  );
   const msgId = sanitizeId(body.msgId || '', 96);
-  if (!friendId) throw new Error('friend_required');
   if (!msgId) throw new Error('msg_required');
 
   const room = chatRoomId(playerId, friendId);
@@ -1633,10 +1641,12 @@ async function actionChatDelete(event, body) {
 
 async function actionChatReact(event, body) {
   const { playerId } = await requirePlayer(event, body);
-  const friendId = sanitizeId(body.friendId || body.withFriendId);
+  const friendId = await requireFriendship(
+    playerId,
+    body.friendId || body.withFriendId
+  );
   const msgId = sanitizeId(body.msgId || '', 96);
   const emoji = safe(body.emoji || '').slice(0, 8);
-  if (!friendId) throw new Error('friend_required');
   if (!msgId) throw new Error('msg_required');
 
   const room = chatRoomId(playerId, friendId);
