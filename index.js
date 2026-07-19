@@ -437,6 +437,11 @@ function expectedPeerForPlayer(room, playerId) {
   return '';
 }
 
+function isRoomViewer(room, playerId) {
+  return isRoomParticipant(room, playerId) ||
+    safe(room?.invitedPlayerId) === safe(playerId);
+}
+
 async function actionSocialSessionIssue(event, body) {
   if (!CFG.socialSessionSecret) throw new Error('social_session_not_configured');
 
@@ -703,7 +708,18 @@ async function actionRoomJoin(event, body) {
   if (num(room.reconnectUntil) > 0 && num(room.reconnectUntil) < now()) return { ok: false, reason: 'room_expired' };
 
   const requestedPeerId = sanitizeId(body.peerId || '', 120);
-  if (room.guestPlayerId && room.guestPlayerId !== playerId) {
+
+  if (
+    room.invitedPlayerId &&
+    room.invitedPlayerId !== playerId &&
+    room.hostPlayerId !== playerId
+  ) {
+    return { ok: await requireFriendship(
+    playerId,
+    body.friendId || body.withFriendId
+  );
+  const msgId = sanitizeId(body.msgId || '', 96);
+  const emoji = safe(body.emoji || '').slice(0, 8);
     return { ok: false, reason: 'room_already_has_guest' };
   }
 
@@ -742,7 +758,7 @@ async function actionRoomGet(event, body) {
     return { ok: false, reason: 'room_not_found' };
   }
 
-  if (!isRoomParticipant(room, playerId)) {
+  if (!isRoomViewer(room, playerId)) {
     return { ok: false, reason: 'room_forbidden' };
   }
 
@@ -829,9 +845,31 @@ async function actionSignalSend(event, body) {
 
   const roomRow = roomId ? await kvGet(`room:${roomId}`) : null;
   const room = payload(roomRow);
-  if (!roomRow || room.roomSecretHash !== hash(roomSecret)) return { ok: false, reason: 'room_not_found' };
-  if (room.status === 'closed' || num(room.closedAt) > 0) return { ok: false, reason: 'room_closed' };
-  if (!toPeerId || !fromPeerId || !type) throw new Error('bad_signal');
+
+  if (!roomRow || room.roomSecretHash !== hash(roomSecret)) {
+    return { ok: false, reason: 'room_not_found' };
+  }
+  if (room.status === 'closed' || num(room.closedAt) > 0) {
+    return { ok: false, reason: 'room_closed' };
+  }
+  if (!isRoomParticipant(room, playerId)) {
+    return { ok: false, reason: 'room_forbidden' };
+  }
+  if (!toPeerId || !fromPeerId || !type) {
+    throw new Error('bad_signal');
+  }
+
+  const expectedFromPeerId = expectedPeerForPlayer(room, playerId);
+  const allowedPeers = new Set(
+    [room.hostPeerId, room.guestPeerId].filter(Boolean)
+  );
+
+  if (!expectedFromPeerId || fromPeerId !== expectedFromPeerId) {
+    return { ok: false, reason: 'peer_identity_mismatch' };
+  }
+  if (!allowedPeers.has(toPeerId) || toPeerId === fromPeerId) {
+    return { ok: false, reason: 'peer_target_forbidden' };
+  }
 
   const seq = `${now().toString().padStart(13, '0')}_${crypto.randomBytes(4).toString('hex')}`;
   const expiresAt = now() + CFG.signalTtlMs;
@@ -861,16 +899,26 @@ async function actionSignalSend(event, body) {
 }
 
 async function actionSignalPoll(event, body) {
-  await requirePlayer(event, body);
+  const { playerId } = await requirePlayer(event, body);
   const roomId = sanitizeId(body.roomId);
   const roomSecret = safe(body.roomSecret || body.secret || body.key || '');
   const peerId = sanitizeId(body.peerId, 140);
 
   const roomRow = roomId ? await kvGet(`room:${roomId}`) : null;
   const room = payload(roomRow);
-  if (!roomRow || room.roomSecretHash !== hash(roomSecret)) return { ok: false, reason: 'room_not_found' };
-  if (room.status === 'closed' || num(room.closedAt) > 0) return { ok: false, reason: 'room_closed' };
+  if (!roomRow || room.roomSecretHash !== hash(roomSecret)) {
+    return { ok: false, reason: 'room_not_found' };
+  }
+  if (room.status === 'closed' || num(room.closedAt) > 0) {
+    return { ok: false, reason: 'room_closed' };
+  }
+  if (!isRoomParticipant(room, playerId)) {
+    return { ok: false, reason: 'room_forbidden' };
+  }
   if (!peerId) throw new Error('peer_id_required');
+  if (expectedPeerForPlayer(room, playerId) !== peerId) {
+    return { ok: false, reason: 'peer_identity_mismatch' };
+  }
 
   const rows = await kvPrefix(`signal:${roomId}:${peerId}:`, 200);
   const messages = [];
@@ -1545,6 +1593,16 @@ async function actionChatDelete(event, body) {
   for (const row of rows) {
     const msg = payload(row);
     if (msg?.msgId !== msgId) continue;
+
+    const participants = new Set([
+      safe(msg.fromFriendId),
+      safe(msg.toFriendId)
+    ]);
+
+    if (!participants.has(playerId) || !participants.has(friendId)) {
+      throw new Error('chat_message_forbidden');
+    }
+
     await kvDelete(row.pk).catch(() => null);
     deleted++;
     break;
@@ -1571,7 +1629,18 @@ async function actionChatReact(event, body) {
     const msg = payload(row);
     if (msg?.msgId !== msgId) continue;
 
-    msg.reactions = msg.reactions && typeof msg.reactions === 'object' ? msg.reactions : {};
+    const participants = new Set([
+      safe(msg.fromFriendId),
+      safe(msg.toFriendId)
+    ]);
+
+    if (!participants.has(playerId) || !participants.has(friendId)) {
+      throw new Error('chat_message_forbidden');
+    }
+
+    msg.reactions = msg.reactions && typeof msg.reactions === 'object'
+      ? msg.reactions
+      : {};
     let mine = msg.reactions[playerId];
 
     if (typeof mine === 'string') mine = mine ? [mine] : [];
@@ -1656,8 +1725,10 @@ async function actionVoiceHistory(event, body) {
 
 async function actionVoiceCallCreate(event, body) {
   const { playerId } = await requirePlayer(event, body);
-  const toFriendId = sanitizeId(body.toFriendId || body.friendId);
-  if (!toFriendId) throw new Error('to_friend_required');
+  const toFriendId = await requireFriendship(
+    playerId,
+    body.toFriendId || body.friendId
+  );
 
   const peerId = sanitizeId(body.peerId || `${playerId}:voice:${rid('p')}`, 140);
   const roomRes = await actionRoomCreate(event, {
@@ -1665,6 +1736,22 @@ async function actionVoiceCallCreate(event, body) {
     gameId: 'voice_call',
     peerId
   });
+
+  const roomRow = await kvGet(`room:${roomRes.roomId}`);
+  const voiceRoom = payload(roomRow);
+
+  if (roomRow) {
+    voiceRoom.invitedPlayerId = toFriendId;
+    voiceRoom.updatedAt = now();
+
+    await kvPut({
+      pk: `room:${roomRes.roomId}`,
+      type: 'room',
+      owner: playerId,
+      expiresAt: voiceRoom.reconnectUntil || now() + CFG.roomTtlMs,
+      data: voiceRoom
+    });
+  }
 
   const callId = rid('voice');
   await saveVoiceLog({
