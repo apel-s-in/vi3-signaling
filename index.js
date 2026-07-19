@@ -34,7 +34,7 @@ const CFG = {
   socialSessionTtlMs: Math.max(300000, Math.min(num(process.env.SOCIAL_SESSION_TTL_MS, 1200000), 3600000)),
   allowLegacyAuth: safe(process.env.ALLOW_LEGACY_AUTH || '0') === '1',
   chatE2eeV2: safe(process.env.CHAT_E2EE_V2 || '0') === '1',
-  allowPlaintextChat: safe(process.env.ALLOW_PLAINTEXT_CHAT || '1') === '1',
+  allowPlaintextChat: safe(process.env.ALLOW_PLAINTEXT_CHAT || '0') === '1',
   turnSharedSecret: safe(process.env.TURN_SHARED_SECRET || ''),
   turnCredentialTtlSec: Math.max(
     300,
@@ -1261,7 +1261,20 @@ async function actionPresenceBatch(event, body) {
   return { ok: true, presence };
 }
 
-async function sendSystemWebPush({ toPlayerId, title, body, url = './', tag = 'vi3-notification', requireInteraction = false, kind = '', fromFriendId = '', gameId = '', roomId = '', roomSecret = '', msgId = '', callId = '' } = {}) {
+async function sendSystemWebPush({
+  toPlayerId,
+  title,
+  body,
+  url = './',
+  tag = 'vi3-notification',
+  requireInteraction = false,
+  kind = '',
+  fromFriendId = '',
+  gameId = '',
+  roomId = '',
+  msgId = '',
+  callId = ''
+} = {}) {
   if (!CFG.webPushFunctionUrl || !CFG.webPushSecret || !toPlayerId) return { ok: false, skipped: true };
 
   try {
@@ -1283,7 +1296,6 @@ async function sendSystemWebPush({ toPlayerId, title, body, url = './', tag = 'v
         fromFriendId,
         gameId,
         roomId,
-        roomSecret,
         msgId,
         callId
       })
@@ -1324,8 +1336,7 @@ async function actionPushSend(event, body) {
       pushId,
       fromFriendId: playerId,
       kind,
-      roomId: String(data.roomId || ''),
-      msgId: String(data.msgId || ''),
+      gameId,
       roomId,
       roomSecret,
       text,
@@ -1722,6 +1733,7 @@ async function actionCryptoDeviceRevoke(event, body) {
   const pk = `cryptoDevice:${playerId}:${deviceId}`;
   const row = await kvGet(pk);
   const data = payload(row);
+
   if (!row || data.ownerId !== playerId) {
     throw new Error('crypto_device_not_found');
   }
@@ -1734,12 +1746,89 @@ async function actionCryptoDeviceRevoke(event, body) {
     type: 'cryptoDevice',
     owner: playerId,
     data
-   const createdAt = now();
+  });
+
+  return {
+    ok: true,
+    revoked: true,
+    deviceId
+  };
+}
+
+async function findChatRow(room, msgId) {
+  const rows = await kvPrefix(`chat:${room}:`, 300);
+  return rows.find(row => payload(row)?.msgId === msgId) || null;
+}
+
+async function requireChatMessageContext(event, body, {
+  cryptoVersion = 0
+} = {}) {
+  const context = await requireFriendContext(event, body);
+  const msgId = sanitizeId(body.msgId, 96);
+
+  if (!msgId) throw new Error('msg_required');
+
+  const row = await findChatRow(context.room, msgId);
+  if (!row) throw new Error('chat_message_not_found');
+
+  const message = payload(row);
+  const participants = new Set([
+    safe(message.fromFriendId),
+    safe(message.toFriendId)
+  ]);
+
+  if (
+    !participants.has(context.playerId) ||
+    !participants.has(context.friendId)
+  ) {
+    throw new Error('chat_message_forbidden');
+  }
+
+  if (
+    cryptoVersion > 0 &&
+    num(message.cryptoVersion) !== cryptoVersion
+  ) {
+    throw new Error('chat_crypto_version_mismatch');
+  }
+
+  return {
+    ...context,
+    row,
+    message,
+    msgId
+  };
+}
+
+async function actionChatSendV2(event, body) {
+  if (!CFG.chatE2eeV2) {
+    throw new Error('chat_e2ee_disabled');
+  }
+
+  const {
+    playerId,
+    friendId: toFriendId,
+    room
+  } = await requireFriendContext(event, body, {
+    friendFields: ['toFriendId', 'friendId']
+  });
+
+  const cryptoPack = await validateCryptoPack({
+    pack: body.crypto,
+    playerId,
+    friendId: toFriendId
+  });
+
+  const createdAt = now();
   const msgId = rid('chat');
   const clientMsgId = sanitizeId(
     body.clientMsgId || cryptoPack.clientMsgId,
     120
   );
+
+  if (!clientMsgId) {
+    throw new Error('client_msg_id_required');
+  }
+
   const msg = {
     msgId,
     clientMsgId,
@@ -1756,7 +1845,7 @@ async function actionCryptoDeviceRevoke(event, body) {
   };
 
   const chatPk =
-    `chat:${room}:${createdAt.toString().padStart(13, '0')}:${msgId}`;
+    `chat:${room}:${String(createdAt).padStart(13, '0')}:${msgId}`;
 
   await kvPut({
     pk: chatPk,
@@ -1769,6 +1858,7 @@ async function actionCryptoDeviceRevoke(event, body) {
   const roomState = await getChatRoomState(room);
   if (roomState.purgeBefore >= createdAt) {
     await kvDelete(chatPk).catch(() => null);
+
     return {
       ok: false,
       reason: 'chat_purged_during_send',
@@ -1780,7 +1870,7 @@ async function actionCryptoDeviceRevoke(event, body) {
   const expiresAt = createdAt + 7 * 24 * 60 * 60 * 1000;
 
   await kvPut({
-    pk: `push:${toFriendId}:${createdAt.toString().padStart(13, '0')}_${pushId}`,
+    pk: `push:${toFriendId}:${String(createdAt).padStart(13, '0')}_${pushId}`,
     type: 'push',
     owner: toFriendId,
     expiresAt,
@@ -1797,7 +1887,9 @@ async function actionCryptoDeviceRevoke(event, body) {
 
   const profile = payload(await kvGet(`profile:${playerId}`));
   const fromName = safe(
-    profile.displayName || body.displayName || 'Друг'
+    profile.displayName ||
+    body.displayName ||
+    'Друг'
   ).slice(0, 80);
 
   const webPush = await sendSystemWebPush({
@@ -1850,91 +1942,6 @@ async function actionChatSettingsSet(event, body) {
   });
 
   return { ok: true, settings };
-}
-
-async function actionChatSend(event, body) {
-  const { playerId } = await requirePlayer(event, body);
-  const toFriendId = await requireFriendship(
-    playerId,
-    body.toFriendId || body.friendId
-  );
-  const text = safe(body.text || '').slice(0, 1000);
-  if (!text) throw new Error('text_required');
-
-  const createdAt = now();
-  const msgId = rid('chat');
-  const room = chatRoomId(playerId, toFriendId);
-
-  const msg = {
-    msgId,
-    clientMsgId: sanitizeId(body.clientMsgId || '', 96),
-    room,
-    fromFriendId: playerId,
-    toFriendId,
-    text,
-    replyToMsgId: sanitizeId(body.replyToMsgId || '', 96),
-    replyText: safe(body.replyText || '').slice(0, 160),
-    reactions: {},
-    createdAt,
-    deliveredAt: 0,
-    readAt: 0
-  };
-
-  const chatPk =
-    `chat:${room}:${createdAt.toString().padStart(13, '0')}:${msgId}`;
-
-  await kvPut({
-    pk: chatPk,
-    type: 'chat',
-    owner: room,
-    expiresAt: createdAt + 30 * 24 * 60 * 60 * 1000,
-    data: msg
-  });
-
-  const roomState = await getChatRoomState(room);
-  if (roomState.purgeBefore >= createdAt) {
-    await kvDelete(chatPk).catch(() => null);
-    return {
-      ok: false,
-      reason: 'chat_purged_during_send',
-      retryable: true
-    };
-  }
-
-  const chatPushId = rid('push');
-
-  await kvPut({
-    pk: `push:${toFriendId}:${createdAt.toString().padStart(13, '0')}_${chatPushId}`,
-    type: 'push',
-    owner: toFriendId,
-    expiresAt: createdAt + 7 * 24 * 60 * 60 * 1000,
-    data: {
-      pushId: chatPushId,
-      msgId,
-      fromFriendId: playerId,
-      kind: 'CHAT_MESSAGE',
-      text,
-      createdAt,
-      expiresAt: createdAt + 7 * 24 * 60 * 60 * 1000
-    }
-  }).catch(() => null);
-
-  const profile = payload(await kvGet(`profile:${playerId}`));
-  const fromName = safe(profile.displayName || body.displayName || 'Друг').slice(0, 80);
-
-  const webPush = await sendSystemWebPush({
-    toPlayerId: toFriendId,
-    title: '💬 Новое сообщение',
-    body: `Пользователь ${fromName} прислал вам сообщение`,
-    url: `./?openFriends=1&chatWith=${encodeURIComponent(playerId)}`,
-    tag: `chat-${chatRoomId(playerId, toFriendId)}`,
-    requireInteraction: true,
-    kind: 'CHAT_MESSAGE',
-    fromFriendId: playerId,
-    msgId
-  });
-
-  return { ok: true, msgId, clientMsgId: msg.clientMsgId, createdAt, webPush };
 }
 
 async function actionChatPoll(event, body) {
@@ -2085,65 +2092,18 @@ async function actionChatRead(event, body) {
   return actionChatReceipt(event, body, 'read');
 }
 
-async function actionChatDelete(event, body) {
-  const { playerId } = await requirePlayer(event, body);
-  const friendId = await requireFriendship(
-    playerId,
-    body.friendId || body.withFriendId
-  );
-  const msgId = sanitizeId(body.msgId || '', 96);
-  if (!msgId) throw new Error('msg_required');
-
-  const room = chatRoomId(playerId, friendId);
-  const rows = await kvPrefix(`chat:${room}:`, 300);
-  let deleted = 0;
-
-  for (const row of rows) {
-    const msg = payload(row);
-    if (msg?.msgId !== msgId) continue;
-
-    const participants = new Set([
-      safe(msg.fromFriendId),
-      safe(msg.toFriendId)
-    ]);
-
-    if (!participants.has(playerId) || !participants.has(friendId)) {
-      throw new Error('chat_message_forbidden');
-    }
-
-    await kvDelete(row.pk).catch(() => null);
-    deleted++;
-    break;
-  }
-
-  return { ok: true, deleted };
-}
-
 async function actionChatUpdateV2(event, body) {
   if (!CFG.chatE2eeV2) throw new Error('chat_e2ee_disabled');
 
   const {
     playerId,
     friendId,
-    room
-  } = await requireFriendContext(event, body);
-
-  const msgId = sanitizeId(body.msgId, 96);
-  if (!msgId) throw new Error('msg_required');
-
-  const row = await findChatRow(room, msgId);
-  const msg = payload(row);
-  if (!row || num(msg.cryptoVersion) !== 2) {
-    throw new Error('chat_message_not_found');
-  }
-
-  const participants = new Set([
-    safe(msg.fromFriendId),
-    safe(msg.toFriendId)
-  ]);
-  if (!participants.has(playerId) || !participants.has(friendId)) {
-    throw new Error('chat_message_forbidden');
-  }
+    room,
+    row,
+    message: msg
+  } = await requireChatMessageContext(event, body, {
+    cryptoVersion: 2
+  });
 
   msg.crypto = await validateCryptoPack({
     pack: body.crypto,
@@ -2175,25 +2135,12 @@ async function actionChatDeleteV2(event, body) {
   const {
     playerId,
     friendId,
-    room
-  } = await requireFriendContext(event, body);
-
-  const msgId = sanitizeId(body.msgId, 96);
-  if (!msgId) throw new Error('msg_required');
-
-  const row = await findChatRow(room, msgId);
-  const msg = payload(row);
-  if (!row || num(msg.cryptoVersion) !== 2) {
-    throw new Error('chat_message_not_found');
-  }
-
-  const participants = new Set([
-    safe(msg.fromFriendId),
-    safe(msg.toFriendId)
-  ]);
-  if (!participants.has(playerId) || !participants.has(friendId)) {
-    throw new Error('chat_message_forbidden');
-  }
+    room,
+    row,
+    message: msg
+  } = await requireChatMessageContext(event, body, {
+    cryptoVersion: 2
+  });
 
   msg.crypto = await validateCryptoPack({
     pack: body.crypto,
@@ -2219,73 +2166,6 @@ async function actionChatDeleteV2(event, body) {
     cryptoVersion: 2,
     at: msg.deletedAt
   };
-}
-
-async function actionChatReact(event, body) {
-  const { playerId } = await requirePlayer(event, body);
-  const friendId = await requireFriendship(
-    playerId,
-    body.friendId || body.withFriendId
-  );
-  const msgId = sanitizeId(body.msgId || '', 96);
-  const emoji = safe(body.emoji || '').slice(0, 8);
-  if (!msgId) throw new Error('msg_required');
-
-  const room = chatRoomId(playerId, friendId);
-  const rows = await kvPrefix(`chat:${room}:`, 300);
-  const at = now();
-  let updated = 0;
-  let reactions = {};
-
-  for (const row of rows) {
-    const msg = payload(row);
-    if (msg?.msgId !== msgId) continue;
-
-    const participants = new Set([
-      safe(msg.fromFriendId),
-      safe(msg.toFriendId)
-    ]);
-
-    if (!participants.has(playerId) || !participants.has(friendId)) {
-      throw new Error('chat_message_forbidden');
-    }
-
-    msg.reactions = msg.reactions && typeof msg.reactions === 'object'
-      ? msg.reactions
-      : {};
-    let mine = msg.reactions[playerId];
-
-    if (typeof mine === 'string') mine = mine ? [mine] : [];
-    if (!Array.isArray(mine)) mine = [];
-    mine = mine.map(x => safe(x).slice(0, 8)).filter(Boolean).slice(0, 3);
-
-    if (emoji) {
-      mine = mine.includes(emoji)
-        ? mine.filter(x => x !== emoji)
-        : [...mine, emoji].slice(-3);
-    } else {
-      mine = [];
-    }
-
-    if (mine.length) msg.reactions[playerId] = mine;
-    else delete msg.reactions[playerId];
-
-    msg.updatedAt = at;
-    reactions = msg.reactions;
-
-    await kvPut({
-      pk: row.pk,
-      type: 'chat',
-      owner: room,
-      expiresAt: num(row.expires_at) || (num(msg.createdAt) + 30 * 24 * 60 * 60 * 1000),
-      data: msg
-    });
-
-    updated++;
-    break;
-  }
-
-  return { ok: true, updated, at, reactions };
 }
 
 async function saveVoiceLog({ callId, fromPlayerId, toPlayerId, roomId, status, startedAt = 0, endedAt = 0, durationSec = 0 } = {}) {
@@ -2397,13 +2277,11 @@ async function actionVoiceCallCreate(event, body) {
     toPlayerId: toFriendId,
     title: '📞 Входящий звонок',
     body: `Пользователь ${fromName} звонит вам`,
-    url: `./?openFriends=1&voiceWith=${encodeURIComponent(playerId)}&voiceRoom=${encodeURIComponent(roomRes.roomId)}&key=${encodeURIComponent(roomRes.roomSecret)}&callId=${encodeURIComponent(callId)}`,
+    url: './?openFriends=1',
     tag: `voice-${roomRes.roomId}`,
     requireInteraction: true,
     kind: 'VOICE_CALL',
     fromFriendId: playerId,
-    roomId: roomRes.roomId,
-    roomSecret: roomRes.roomSecret,
     callId
   });
 
@@ -2632,7 +2510,7 @@ async function actionLeaderboardGet(event, body) {
 }
 
 async function actionRtcConfig(event, body) {
-  await requirePlayer(event, body);
+  const { playerId } = await requirePlayer(event, body);
 
   const iceServers = [
     { urls: 'stun:stun.sipnet.ru:3478' },
@@ -2956,7 +2834,6 @@ const ACTIONS = {
   presence_batch: actionPresenceBatch,
   push_send: actionPushSend,
   push_poll: actionPushPoll,
-  chat_send: actionChatSend,
   chat_send_v2: actionChatSendV2,
   chat_update_v2: actionChatUpdateV2,
   chat_delete_v2: actionChatDeleteV2,
@@ -2964,8 +2841,6 @@ const ACTIONS = {
   chat_clear: actionChatClear,
   chat_delivery: actionChatDelivered,
   chat_read: actionChatRead,
-  chat_delete: actionChatDelete,
-  chat_react: actionChatReact,
   voice_history: actionVoiceHistory,
   voice_call_create: actionVoiceCallCreate,
   voice_call_join: actionVoiceCallJoin,
