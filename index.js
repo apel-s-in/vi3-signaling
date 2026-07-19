@@ -1410,8 +1410,7 @@ async function actionPushSend(event, body) {
     kind,
     fromFriendId: playerId,
     gameId,
-    roomId,
-    roomSecret
+    roomId
   });
 
   return { ok: true, pushId, webPush };
@@ -1725,12 +1724,6 @@ function validateCryptoAad({
 
   return aad;
 }
-  const expectedRevision = Math.max(1, num(body.expectedRevision));
-  if (num(msg.revision, 1) !== expectedRevision) {
-    const error = new Error('chat_revision_conflict');
-    error.httpStatus = 409;
-    throw error;
-  }
 
 async function validateCryptoPack({
   pack,
@@ -1903,6 +1896,7 @@ async function actionCryptoDeviceRevoke(event, body) {
     pk,
     type: 'cryptoDevice',
     owner: playerId,
+    expiresAt: data.revokedAt + 30 * 24 * 60 * 60 * 1000,
     data
   });
 
@@ -1952,6 +1946,7 @@ async function actionCryptoDeviceReset(event, body) {
       pk: row.pk,
       type: 'cryptoDevice',
       owner: playerId,
+      expiresAt: at + 30 * 24 * 60 * 60 * 1000,
       data
     });
 
@@ -2148,8 +2143,15 @@ async function actionChatSendV2(event, body) {
   ]);
 
   const roomState = await getChatRoomState(room);
+
   if (roomState.purgeBefore >= createdAt) {
-    await kvDelete(chatPk).catch(() => null);
+    await Promise.all([
+      kvDelete(chatPk).catch(() => null),
+      kvDelete(`chatById:${room}:${msgId}`).catch(() => null),
+      kvDelete(
+        `chatClient:${room}:${playerId}:${clientMsgId}`
+      ).catch(() => null)
+    ]);
 
     return {
       ok: false,
@@ -2462,7 +2464,9 @@ async function actionChatUpdateV2(event, body) {
 }
 
 async function actionChatDeleteV2(event, body) {
-  if (!CFG.chatE2eeV2) throw new Error('chat_e2ee_disabled');
+  if (!CFG.chatE2eeV2) {
+    throw new Error('chat_e2ee_disabled');
+  }
 
   const {
     playerId,
@@ -2474,6 +2478,17 @@ async function actionChatDeleteV2(event, body) {
     cryptoVersion: 2
   });
 
+  const expectedRevision = Math.max(
+    1,
+    num(body.expectedRevision, 1)
+  );
+
+  if (num(msg.revision, 1) !== expectedRevision) {
+    const error = new Error('chat_revision_conflict');
+    error.httpStatus = 409;
+    throw error;
+  }
+
   msg.crypto = await validateCryptoPack({
     pack: body.crypto,
     playerId,
@@ -2483,18 +2498,20 @@ async function actionChatDeleteV2(event, body) {
     clientMsgId: body.crypto?.clientMsgId,
     subjectMsgId: msg.msgId
   });
-  msg.deletedAt = Math.max(num(body.deletedAt), now());
-  msg.updatedAt = msg.deletedAt;
 
   msg.revision = expectedRevision + 1;
-  msg.deletedAt = Math.max(num(body.deletedAt), now());
+  msg.deletedAt = Math.max(
+    num(body.deletedAt),
+    now()
+  );
   msg.updatedAt = msg.deletedAt;
 
   const changed = await kvCompareAndPut({
     row,
     type: 'chat',
     owner: room,
-    expiresAt: num(row.expires_at) ||
+    expiresAt:
+      num(row.expires_at) ||
       num(msg.createdAt) + 30 * 24 * 60 * 60 * 1000,
     data: msg
   });
@@ -3234,22 +3251,44 @@ exports.handler = async event => {
 
     return reply(event, 200, await fn(event, body));
   } catch (e) {
-    const msg = safe(e.message || 'server_error');
-    const explicitStatus = num(e?.httpStatus);
-    const status = explicitStatus || (
-      /RESOURCE_EXHAUSTED|resource_exhausted|Too many|overload/i.test(msg)
-        ? 429
-        : (/social_session|yandex_oauth/.test(msg)
-          ? 401
-          : (/forbidden|identity_mismatch/.test(msg)
-            ? 403
-            : (/chat_revision_conflict/.test(msg)
-              ? 409
-              : (/crypto_.*(?:missing|not_ready|conflict)|chat_e2ee_disabled/.test(msg)
-                ? 409
-                : (/required|bad_|not_found/.test(msg) ? 400 : 500))))
-    );
+    const msg = safe(e?.message || 'server_error');
+    let status = num(e?.httpStatus);
 
-    return reply(event, status, { ok: false, error: msg });
+    if (!status) {
+      if (
+        /RESOURCE_EXHAUSTED|resource_exhausted|Too many|overload/i.test(msg)
+      ) {
+        status = 429;
+      } else if (
+        /social_session|yandex_oauth/i.test(msg)
+      ) {
+        status = 401;
+      } else if (
+        /forbidden|identity_mismatch/i.test(msg)
+      ) {
+        status = 403;
+      } else if (
+        /chat_revision_conflict|crypto_.*(?:missing|not_ready|conflict)|chat_e2ee_disabled/i.test(msg)
+      ) {
+        status = 409;
+      } else if (
+        /required|bad_|not_found/i.test(msg)
+      ) {
+        status = 400;
+      } else {
+        status = 500;
+      }
+    }
+
+    console.error('[vi3-signaling]', {
+      action,
+      status,
+      error: msg
+    });
+
+    return reply(event, status, {
+      ok: false,
+      error: msg
+    });
   }
 };
