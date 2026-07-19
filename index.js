@@ -2640,9 +2640,29 @@ async function actionRtcConfig(event, body) {
     { urls: 'stun:stun.cloudflare.com:3478' }
   ];
 
-  const hasTurn = !CFG.turnDisabled && !!(CFG.turnUrls.length && CFG.turnUsername && CFG.turnCredential);
+  const temporaryTurn = !CFG.turnDisabled &&
+    CFG.turnUrls.length &&
+    CFG.turnSharedSecret;
 
-  if (hasTurn) {
+  const staticTurn = !CFG.turnDisabled &&
+    CFG.turnUrls.length &&
+    CFG.turnUsername &&
+    CFG.turnCredential;
+
+  if (temporaryTurn) {
+    const expires = Math.floor(Date.now() / 1000) + CFG.turnCredentialTtlSec;
+    const username = `${expires}:${playerId}`;
+    const credential = crypto
+      .createHmac('sha1', CFG.turnSharedSecret)
+      .update(username)
+      .digest('base64');
+
+    iceServers.unshift({
+      urls: CFG.turnUrls,
+      username,
+      credential
+    });
+  } else if (staticTurn) {
     iceServers.unshift({
       urls: CFG.turnUrls,
       username: CFG.turnUsername,
@@ -2650,10 +2670,14 @@ async function actionRtcConfig(event, body) {
     });
   }
 
+  const hasTurn = !!(temporaryTurn || staticTurn);
+
   return {
     ok: true,
     iceServers,
     hasTurn,
+    temporaryCredentials: !!temporaryTurn,
+    expiresInSec: temporaryTurn ? CFG.turnCredentialTtlSec : 0,
     turnDisabled: CFG.turnDisabled
   };
 }
