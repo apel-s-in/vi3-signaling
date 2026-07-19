@@ -29,7 +29,10 @@ const CFG = {
   turnCredential: safe(process.env.TURN_CREDENTIAL || ''),
   turnDisabled: safe(process.env.TURN_DISABLED || '1') === '1',
   webPushFunctionUrl: safe(process.env.WEBPUSH_FUNCTION_URL || ''),
-  webPushSecret: safe(process.env.WEBPUSH_SECRET || '')
+  webPushSecret: safe(process.env.WEBPUSH_SECRET || ''),
+  socialSessionSecret: safe(process.env.SOCIAL_SESSION_SECRET || ''),
+  socialSessionTtlMs: Math.max(300000, Math.min(num(process.env.SOCIAL_SESSION_TTL_MS, 1200000), 3600000)),
+  allowLegacyAuth: safe(process.env.ALLOW_LEGACY_AUTH || '0') === '1'
 };
 
 const TABLE = `${CFG.prefix}kv`;
@@ -53,6 +56,112 @@ function rid(prefix = 'id') {
 
 function hash(v) {
   return crypto.createHash('sha256').update(String(v || ''), 'utf8').digest('hex');
+}
+
+function base64url(value) {
+  return Buffer.from(value)
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/g, '');
+}
+
+function base64urlDecode(value) {
+  const raw = safe(value).replace(/-/g, '+').replace(/_/g, '/');
+  return Buffer.from(raw + '='.repeat((4 - raw.length % 4) % 4), 'base64');
+}
+
+function hmac(value) {
+  if (!CFG.socialSessionSecret) throw new Error('social_session_not_configured');
+  return base64url(
+    crypto.createHmac('sha256', CFG.socialSessionSecret)
+      .update(String(value || ''), 'utf8')
+      .digest()
+  );
+}
+
+function timingSafeEqualText(a, b) {
+  const aa = Buffer.from(String(a || ''), 'utf8');
+  const bb = Buffer.from(String(b || ''), 'utf8');
+  return aa.length === bb.length && crypto.timingSafeEqual(aa, bb);
+}
+
+function makeFriendId(yandexId) {
+  return `ya_${hash(`friend:${safe(yandexId)}`).slice(0, 24)}`;
+}
+
+function issueSocialSession(claims = {}) {
+  const header = base64url(JSON.stringify({ alg: 'HS256', typ: 'VI3S' }));
+  const body = base64url(JSON.stringify(claims));
+  const unsigned = `${header}.${body}`;
+  return `${unsigned}.${hmac(unsigned)}`;
+}
+
+function verifySocialSession(token) {
+  const parts = safe(token).split('.');
+  if (parts.length !== 3) throw new Error('bad_social_session');
+
+  const unsigned = `${parts[0]}.${parts[1]}`;
+  if (!timingSafeEqualText(hmac(unsigned), parts[2])) {
+    throw new Error('bad_social_session');
+  }
+
+  let claims;
+  try {
+    claims = JSON.parse(base64urlDecode(parts[1]).toString('utf8'));
+  } catch {
+    throw new Error('bad_social_session');
+  }
+
+  if (!claims?.sub || !claims?.yidHash) throw new Error('bad_social_session');
+  if (num(claims.exp) <= now()) throw new Error('social_session_expired');
+  if (num(claims.iat) > now() + 60000) throw new Error('bad_social_session_clock');
+
+  return claims;
+}
+
+function headerValue(event, name) {
+  const headers = event?.headers || {};
+  const target = String(name || '').toLowerCase();
+  const key = Object.keys(headers).find(x => String(x).toLowerCase() === target);
+  return key ? safe(headers[key]) : '';
+}
+
+async function verifyYandexOAuth(event, body) {
+  const token = headerValue(event, 'x-yandex-oauth') || safe(body.yandexOAuthToken || '');
+  if (!token) throw new Error('yandex_oauth_required');
+
+  const response = await fetch('https://login.yandex.ru/info?format=json', {
+    method: 'GET',
+    headers: {
+      Authorization: `OAuth ${token}`,
+      Accept: 'application/json'
+    }
+  });
+
+  if (!response.ok) {
+    if (response.status === 401 || response.status === 403) {
+      throw new Error('bad_yandex_oauth');
+    }
+    throw new Error('yandex_oauth_unavailable');
+  }
+
+  const profile = await response.json().catch(() => null);
+  const yandexId = safe(profile?.id);
+  if (!yandexId) throw new Error('bad_yandex_profile');
+
+  return {
+    yandexId,
+    friendId: makeFriendId(yandexId),
+    displayName: safe(
+      body.displayName ||
+      profile.real_name ||
+      profile.display_name ||
+      profile.login ||
+      'Слушатель'
+    ).slice(0, 80),
+    avatarUrl: safe(body.avatarUrl || '').slice(0, 400)
+  };
 }
 
 function publicIpHash(event) {
@@ -98,7 +207,7 @@ function corsHeaders(event) {
   return {
     'Access-Control-Allow-Origin': allow,
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-    'Access-Control-Allow-Headers': reqHeaders || 'Content-Type, Accept, Authorization, X-Requested-With, X-Vi3-Player, X-Vi3-Secret, X-Vi3-Admin',
+    'Access-Control-Allow-Headers': reqHeaders || 'Content-Type, Accept, X-Requested-With, X-Vi3-Session, X-Yandex-OAuth, X-Vi3-Admin',
     'Access-Control-Max-Age': '86400',
     'Vary': 'Origin'
   };
@@ -296,41 +405,109 @@ async function kvPrefix(prefix, limit = 100) {
   return rowsOf(res).filter(r => !num(r.expires_at) || num(r.expires_at) >= t);
 }
 
-async function requirePlayer(body) {
-  const playerId = sanitizeId(body.playerId || body.userId);
-  const clientSecret = safe(body.clientSecret || body.secret || '');
-  if (!playerId) throw new Error('player_id_required');
+async function actionSocialSessionIssue(event, body) {
+  if (!CFG.socialSessionSecret) throw new Error('social_session_not_configured');
 
-  const row = await kvGet(`player:${playerId}`);
-  if (!row) {
-    if (!clientSecret) throw new Error('client_secret_required');
-    await kvPut({
-      pk: `player:${playerId}`,
-      type: 'player',
-      owner: playerId,
-      data: {
-        playerId,
-        clientSecretHash: hash(clientSecret),
-        displayName: safe(body.displayName || 'Игрок').slice(0, 80),
-        avatarUrl: safe(body.avatarUrl || ''),
-        createdAt: now(),
-        updatedAt: now()
-      }
-    });
-    return { playerId };
+  const identity = await verifyYandexOAuth(event, body);
+  const issuedAt = now();
+  const expiresAt = issuedAt + CFG.socialSessionTtlMs;
+
+  const oldPlayer = payload(await kvGet(`player:${identity.friendId}`));
+  const oldProfile = payload(await kvGet(`profile:${identity.friendId}`));
+
+  await kvPut({
+    pk: `player:${identity.friendId}`,
+    type: 'player',
+    owner: identity.friendId,
+    data: {
+      ...oldPlayer,
+      playerId: identity.friendId,
+      authVersion: 2,
+      yandexIdHash: hash(`ya:${identity.yandexId}`),
+      displayName: identity.displayName,
+      avatarUrl: identity.avatarUrl,
+      createdAt: oldPlayer.createdAt || issuedAt,
+      updatedAt: issuedAt
+    }
+  });
+
+  await kvPut({
+    pk: `profile:${identity.friendId}`,
+    type: 'profile',
+    owner: identity.friendId,
+    data: {
+      ...oldProfile,
+      friendId: identity.friendId,
+      displayName: identity.displayName || oldProfile.displayName || 'Слушатель',
+      avatarUrl: identity.avatarUrl || oldProfile.avatarUrl || '',
+      updatedAt: issuedAt
+    }
+  });
+
+  const session = issueSocialSession({
+    sub: identity.friendId,
+    yidHash: hash(`ya:${identity.yandexId}`),
+    iat: issuedAt,
+    exp: expiresAt,
+    jti: rid('ss'),
+    v: 2
+  });
+
+  return {
+    ok: true,
+    friendId: identity.friendId,
+    socialSession: session,
+    expiresAt,
+    profile: {
+      friendId: identity.friendId,
+      displayName: identity.displayName,
+      avatarUrl: identity.avatarUrl
+    }
+  };
+}
+
+async function requirePlayer(event, body) {
+  const sessionToken =
+    headerValue(event, 'x-vi3-session') ||
+    safe(body.socialSession || '');
+
+  if (sessionToken) {
+    const claims = verifySocialSession(sessionToken);
+    const requestedId = sanitizeId(body.playerId || body.userId || '');
+
+    if (requestedId && requestedId !== claims.sub) {
+      throw new Error('player_identity_mismatch');
+    }
+
+    const row = await kvGet(`player:${claims.sub}`);
+    if (!row) throw new Error('player_not_registered');
+
+    return {
+      playerId: claims.sub,
+      sessionId: safe(claims.jti),
+      expiresAt: num(claims.exp),
+      authVersion: 2
+    };
   }
 
-  const p = payload(row);
-  if (p.clientSecretHash && hash(clientSecret) !== p.clientSecretHash) throw new Error('bad_player_secret');
-  return { playerId };
+  if (!CFG.allowLegacyAuth) throw new Error('social_session_required');
+
+  const playerId = sanitizeId(body.playerId || body.userId);
+  const clientSecret = safe(body.clientSecret || body.secret || '');
+  if (!playerId || !clientSecret) throw new Error('social_session_required');
+
+  const row = await kvGet(`player:${playerId}`);
+  const player = payload(row);
+  if (!row || !player.clientSecretHash) throw new Error('bad_player_secret');
+  if (hash(clientSecret) !== player.clientSecretHash) throw new Error('bad_player_secret');
+
+  return { playerId, authVersion: 1 };
 }
 
 async function actionPlayerRegister(event, body) {
-  const playerId = sanitizeId(body.playerId || body.userId);
-  const clientSecret = safe(body.clientSecret || body.secret || '');
-  if (!playerId || !clientSecret) throw new Error('player_id_and_secret_required');
-
+  const { playerId } = await requirePlayer(event, body);
   const old = payload(await kvGet(`player:${playerId}`));
+
   await kvPut({
     pk: `player:${playerId}`,
     type: 'player',
@@ -338,9 +515,9 @@ async function actionPlayerRegister(event, body) {
     data: {
       ...old,
       playerId,
-      clientSecretHash: old.clientSecretHash || hash(clientSecret),
+      authVersion: Math.max(2, num(old.authVersion)),
       displayName: safe(body.displayName || old.displayName || 'Игрок').slice(0, 80),
-      avatarUrl: safe(body.avatarUrl || old.avatarUrl || ''),
+      avatarUrl: safe(body.avatarUrl || old.avatarUrl || '').slice(0, 400),
       updatedAt: now(),
       createdAt: old.createdAt || now()
     }
@@ -350,7 +527,7 @@ async function actionPlayerRegister(event, body) {
 }
 
 async function actionHeartbeat(event, body) {
-  const { playerId } = await requirePlayer(body);
+  const { playerId } = await requirePlayer(event, body);
   const deviceId = sanitizeId(body.deviceId || 'web', 80) || 'web';
   const currentGameId = sanitizeId(body.gameId || body.currentGameId || '', 80);
   const currentRoomId = sanitizeId(body.roomId || body.currentRoomId || '', 96);
@@ -376,7 +553,7 @@ async function actionHeartbeat(event, body) {
 }
 
 async function actionFriendStatus(event, body) {
-  await requirePlayer(body);
+  await requirePlayer(event, body);
   const targetId = sanitizeId(body.targetId || body.friendId);
   if (!targetId) throw new Error('target_required');
 
@@ -393,7 +570,7 @@ async function actionFriendStatus(event, body) {
 }
 
 async function actionFriendInviteCreate(event, body) {
-  const { playerId } = await requirePlayer(body);
+  const { playerId } = await requirePlayer(event, body);
   const inviteId = rid('fi');
   const secret = crypto.randomBytes(16).toString('hex');
   const expiresAt = now() + CFG.friendInviteTtlMs;
@@ -431,7 +608,7 @@ async function actionFriendInviteGet(event, body) {
 }
 
 async function actionFriendInviteAccept(event, body) {
-  const { playerId } = await requirePlayer(body);
+  const { playerId } = await requirePlayer(event, body);
   const inviteId = sanitizeId(body.inviteId);
   const secret = safe(body.secret || body.key || '');
   const row = inviteId ? await kvGet(`friendInvite:${inviteId}`) : null;
@@ -455,7 +632,7 @@ async function actionFriendInviteAccept(event, body) {
 }
 
 async function actionRoomCreate(event, body) {
-  const { playerId } = await requirePlayer(body);
+  const { playerId } = await requirePlayer(event, body);
   const gameId = sanitizeId(body.gameId || 'game', 80);
   const roomId = rid('room');
   const roomSecret = crypto.randomBytes(16).toString('hex');
@@ -483,7 +660,7 @@ async function actionRoomCreate(event, body) {
 }
 
 async function actionRoomJoin(event, body) {
-  const { playerId } = await requirePlayer(body);
+  const { playerId } = await requirePlayer(event, body);
   const roomId = sanitizeId(body.roomId);
   const roomSecret = safe(body.roomSecret || body.secret || body.key || '');
   const row = roomId ? await kvGet(`room:${roomId}`) : null;
@@ -523,7 +700,7 @@ async function actionRoomJoin(event, body) {
 }
 
 async function actionRoomGet(event, body) {
-  await requirePlayer(body);
+  await requirePlayer(event, body);
   const roomId = sanitizeId(body.roomId);
   const row = roomId ? await kvGet(`room:${roomId}`) : null;
   const room = payload(row);
@@ -532,7 +709,7 @@ async function actionRoomGet(event, body) {
 }
 
 async function actionRoomClose(event, body) {
-  await requirePlayer(body);
+  await requirePlayer(event, body);
   const roomId = sanitizeId(body.roomId);
   const row = roomId ? await kvGet(`room:${roomId}`) : null;
   const room = payload(row);
@@ -545,7 +722,7 @@ async function actionRoomClose(event, body) {
 }
 
 async function actionRoomSetMode(event, body) {
-  const { playerId } = await requirePlayer(body);
+  const { playerId } = await requirePlayer(event, body);
   const roomId = sanitizeId(body.roomId);
   const roomSecret = safe(body.roomSecret || body.secret || body.key || '');
   const row = roomId ? await kvGet(`room:${roomId}`) : null;
@@ -581,7 +758,7 @@ async function actionRoomSetMode(event, body) {
 }
 
 async function actionSignalSend(event, body) {
-  const { playerId } = await requirePlayer(body);
+  const { playerId } = await requirePlayer(event, body);
   const roomId = sanitizeId(body.roomId);
   const roomSecret = safe(body.roomSecret || body.secret || body.key || '');
   const fromPeerId = sanitizeId(body.fromPeerId || body.peerId, 140);
@@ -619,7 +796,7 @@ async function actionSignalSend(event, body) {
 }
 
 async function actionSignalPoll(event, body) {
-  await requirePlayer(body);
+  await requirePlayer(event, body);
   const roomId = sanitizeId(body.roomId);
   const roomSecret = safe(body.roomSecret || body.secret || body.key || '');
   const peerId = sanitizeId(body.peerId, 140);
@@ -639,7 +816,7 @@ async function actionSignalPoll(event, body) {
 }
 
 async function actionGameInviteCreate(event, body) {
-  const { playerId } = await requirePlayer(body);
+  const { playerId } = await requirePlayer(event, body);
   const toPlayerId = sanitizeId(body.toPlayerId || body.friendId);
   const gameId = sanitizeId(body.gameId || 'game', 80);
   if (!toPlayerId) throw new Error('to_player_required');
@@ -668,14 +845,14 @@ async function actionGameInviteCreate(event, body) {
 }
 
 async function actionGameInvitePoll(event, body) {
-  const { playerId } = await requirePlayer(body);
+  const { playerId } = await requirePlayer(event, body);
   const rows = await kvPrefix('gameInvite:', 200);
   const items = rows.map(payload).filter(x => x.toPlayerId === playerId || x.fromPlayerId === playerId);
   return { ok: true, items };
 }
 
 async function actionGameInviteSet(event, body, status) {
-  const { playerId } = await requirePlayer(body);
+  const { playerId } = await requirePlayer(event, body);
   const gameInviteId = sanitizeId(body.gameInviteId || body.inviteId);
   const row = gameInviteId ? await kvGet(`gameInvite:${gameInviteId}`) : null;
   const inv = payload(row);
@@ -694,7 +871,7 @@ async function actionGameInviteSet(event, body, status) {
 // ===== FRIENDS MODULE (Phase A) =====
 
 async function actionProfileSet(event, body) {
-  const { playerId } = await requirePlayer(body);
+  const { playerId } = await requirePlayer(event, body);
 
   const profile = {
     friendId: playerId,
@@ -714,7 +891,7 @@ async function actionProfileSet(event, body) {
 }
 
 async function actionProfileGet(event, body) {
-  await requirePlayer(body);
+  await requirePlayer(event, body);
 
   const targetId = sanitizeId(body.targetId || body.friendId);
   if (!targetId) return { ok: true, profile: null };
@@ -725,7 +902,7 @@ async function actionProfileGet(event, body) {
 }
 
 async function actionFriendList(event, body) {
-  const { playerId } = await requirePlayer(body);
+  const { playerId } = await requirePlayer(event, body);
 
   const rows = await kvPrefix(`friend:${playerId}:`, 300);
   const items = [];
@@ -756,7 +933,7 @@ async function actionFriendList(event, body) {
 }
 
 async function actionFriendRemove(event, body) {
-  const { playerId } = await requirePlayer(body);
+  const { playerId } = await requirePlayer(event, body);
 
   const targetId = sanitizeId(body.targetId || body.friendId);
   if (!targetId) throw new Error('target_required');
@@ -768,7 +945,7 @@ async function actionFriendRemove(event, body) {
 }
 
 async function actionPresenceBatch(event, body) {
-  await requirePlayer(body);
+  await requirePlayer(event, body);
 
   const ids = Array.isArray(body.friendIds)
     ? body.friendIds.map(sanitizeId).filter(Boolean).slice(0, 50)
@@ -826,7 +1003,7 @@ async function sendSystemWebPush({ toPlayerId, title, body, url = './', tag = 'v
 }
 
 async function actionPushSend(event, body) {
-  const { playerId } = await requirePlayer(body);
+  const { playerId } = await requirePlayer(event, body);
 
   const toFriendId = sanitizeId(body.toFriendId || body.toPlayerId);
   if (!toFriendId) throw new Error('to_friend_required');
@@ -886,7 +1063,7 @@ async function actionPushSend(event, body) {
 }
 
 async function actionPushPoll(event, body) {
-  const { playerId } = await requirePlayer(body);
+  const { playerId } = await requirePlayer(event, body);
 
   const rows = await kvPrefix(`push:${playerId}:`, 100);
   const t = now();
@@ -912,7 +1089,7 @@ function chatRoomId(a, b) {
 }
 
 async function actionChatSend(event, body) {
-  const { playerId } = await requirePlayer(body);
+  const { playerId } = await requirePlayer(event, body);
   const toFriendId = sanitizeId(body.toFriendId || body.friendId);
   const text = safe(body.text || '').slice(0, 1000);
   if (!toFriendId) throw new Error('to_friend_required');
@@ -982,7 +1159,7 @@ async function actionChatSend(event, body) {
 }
 
 async function actionChatPoll(event, body) {
-  const { playerId } = await requirePlayer(body);
+  const { playerId } = await requirePlayer(event, body);
   const friendId = sanitizeId(body.friendId || body.withFriendId);
   const after = num(body.after, 0);
   if (!friendId) throw new Error('friend_required');
@@ -999,7 +1176,7 @@ async function actionChatPoll(event, body) {
 }
 
 async function actionChatClear(event, body) {
-  const { playerId } = await requirePlayer(body);
+  const { playerId } = await requirePlayer(event, body);
   const friendId = sanitizeId(body.friendId || body.withFriendId);
   if (!friendId) throw new Error('friend_required');
 
@@ -1010,7 +1187,7 @@ async function actionChatClear(event, body) {
   return { ok: true, cleared: rows.length };
 }
 async function actionChatReceipt(event, body, receiptKind) {
-  const { playerId } = await requirePlayer(body);
+  const { playerId } = await requirePlayer(event, body);
   const friendId = sanitizeId(body.friendId || body.withFriendId);
   const msgId = sanitizeId(body.msgId || '', 96);
   if (!friendId) throw new Error('friend_required');
@@ -1061,7 +1238,7 @@ async function actionChatRead(event, body) {
 }
 
 async function actionChatDelete(event, body) {
-  const { playerId } = await requirePlayer(body);
+  const { playerId } = await requirePlayer(event, body);
   const friendId = sanitizeId(body.friendId || body.withFriendId);
   const msgId = sanitizeId(body.msgId || '', 96);
   if (!friendId) throw new Error('friend_required');
@@ -1083,7 +1260,7 @@ async function actionChatDelete(event, body) {
 }
 
 async function actionChatReact(event, body) {
-  const { playerId } = await requirePlayer(body);
+  const { playerId } = await requirePlayer(event, body);
   const friendId = sanitizeId(body.friendId || body.withFriendId);
   const msgId = sanitizeId(body.msgId || '', 96);
   const emoji = safe(body.emoji || '').slice(0, 8);
@@ -1169,7 +1346,7 @@ async function saveVoiceLog({ callId, fromPlayerId, toPlayerId, roomId, status, 
 }
 
 async function actionVoiceHistory(event, body) {
-  const { playerId } = await requirePlayer(body);
+  const { playerId } = await requirePlayer(event, body);
   const friendId = sanitizeId(body.friendId || body.withFriendId);
   if (!friendId) throw new Error('friend_required');
 
@@ -1184,7 +1361,7 @@ async function actionVoiceHistory(event, body) {
 }
 
 async function actionVoiceCallCreate(event, body) {
-  const { playerId } = await requirePlayer(body);
+  const { playerId } = await requirePlayer(event, body);
   const toFriendId = sanitizeId(body.toFriendId || body.friendId);
   if (!toFriendId) throw new Error('to_friend_required');
 
@@ -1250,7 +1427,7 @@ async function actionVoiceCallCreate(event, body) {
 }
 
 async function actionVoiceCallJoin(event, body) {
-  const { playerId } = await requirePlayer(body);
+  const { playerId } = await requirePlayer(event, body);
   const friendId = sanitizeId(body.friendId || body.fromFriendId);
   const callId = sanitizeId(body.callId || '', 96);
   const roomId = sanitizeId(body.roomId);
@@ -1296,7 +1473,7 @@ async function actionVoiceCallJoin(event, body) {
 }
 
 async function actionVoiceCallEnd(event, body) {
-  const { playerId } = await requirePlayer(body);
+  const { playerId } = await requirePlayer(event, body);
   const friendId = sanitizeId(body.friendId || body.withFriendId);
   const callId = sanitizeId(body.callId || '', 96);
   const roomId = sanitizeId(body.roomId);
@@ -1321,7 +1498,7 @@ async function actionVoiceCallEnd(event, body) {
 }
 
 async function actionMatchSubmit(event, body) {
-  const { playerId } = await requirePlayer(body);
+  const { playerId } = await requirePlayer(event, body);
   const matchId = sanitizeId(body.matchId || rid('match'));
   const roomId = sanitizeId(body.roomId || '');
   const expiresAt = 0;
@@ -1435,7 +1612,7 @@ async function actionWebPushConfig(event, body) {
 }
 
 async function actionWebPushSubscribe(event, body) {
-  const { playerId } = await requirePlayer(body);
+  const { playerId } = await requirePlayer(event, body);
   const sub = body.subscription || {};
   const endpoint = safe(sub.endpoint || '');
   if (!endpoint) throw new Error('push_endpoint_required');
@@ -1460,7 +1637,7 @@ async function actionWebPushSubscribe(event, body) {
 }
 
 async function actionWebPushUnsubscribe(event, body) {
-  const { playerId } = await requirePlayer(body);
+  const { playerId } = await requirePlayer(event, body);
   const endpoint = safe(body.endpoint || body.subscription?.endpoint || '');
   if (!endpoint) return { ok: true, removed: false };
 
@@ -1473,7 +1650,7 @@ function nearbyCode() {
 }
 
 async function actionNearbyFriendCreate(event, body) {
-  const { playerId } = await requirePlayer(body);
+  const { playerId } = await requirePlayer(event, body);
   const inv = await actionFriendInviteCreate(event, body);
   const code = nearbyCode();
   const expiresAt = now() + CFG.nearbyTtlMs;
@@ -1497,7 +1674,7 @@ async function actionNearbyFriendCreate(event, body) {
 }
 
 async function actionNearbyFriendJoin(event, body) {
-  await requirePlayer(body);
+  await requirePlayer(event, body);
   const code = safe(body.code || '').replace(/\D/g, '').slice(0, 6);
   if (!code) throw new Error('nearby_code_required');
 
@@ -1513,7 +1690,7 @@ async function actionNearbyFriendJoin(event, body) {
 }
 
 async function actionNearbyGameCreate(event, body) {
-  const { playerId } = await requirePlayer(body);
+  const { playerId } = await requirePlayer(event, body);
   const gameId = sanitizeId(body.gameId || 'war_hearts');
   let roomId = sanitizeId(body.roomId || '');
   let roomSecret = safe(body.roomSecret || body.secret || body.key || '');
@@ -1559,7 +1736,7 @@ async function actionNearbyGameCreate(event, body) {
 }
 
 async function actionNearbyGameJoin(event, body) {
-  await requirePlayer(body);
+  await requirePlayer(event, body);
   const code = safe(body.code || '').replace(/\D/g, '').slice(0, 6);
   if (!code) throw new Error('nearby_game_code_required');
 
@@ -1577,7 +1754,7 @@ async function actionNearbyGameJoin(event, body) {
 }
 // ─── LAN Wi-Fi: регистрация и разрешение кодов комнат ───────────────────────
 async function actionLanCodeRegister(event, body) {
-  const { playerId } = await requirePlayer(body);
+  const { playerId } = await requirePlayer(event, body);
   const code = safe(body.code || '').replace(/\D/g, '').slice(0, 6);
   const roomId = sanitizeId(body.roomId);
   const roomSecret = safe(body.roomSecret);
@@ -1628,7 +1805,7 @@ async function actionLanCodeRegister(event, body) {
 }
 
 async function actionLanCodeResolve(event, body) {
-await requirePlayer(body);
+await requirePlayer(event, body);
 const code = safe(body.code || '').replace(/\D/g, '').slice(0, 6);
 if (!code) throw new Error('lan_code_required');
 const row = await kvGet(`lanCode:${code}`);
@@ -1647,6 +1824,7 @@ return {
 };
 }
 const ACTIONS = {
+  social_session_issue: actionSocialSessionIssue,
   player_register: actionPlayerRegister,
   presence_heartbeat: actionHeartbeat,
   heartbeat: actionHeartbeat,
