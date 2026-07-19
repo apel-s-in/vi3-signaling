@@ -405,6 +405,35 @@ async function kvPrefix(prefix, limit = 100) {
   return rowsOf(res).filter(r => !num(r.expires_at) || num(r.expires_at) >= t);
 }
 
+async function areFriends(a, b) {
+  const aa = sanitizeId(a);
+  const bb = sanitizeId(b);
+  if (!aa || !bb || aa === bb) return false;
+
+  const row = await kvGet(`friend:${aa}:${bb}`);
+  const data = payload(row);
+  return !!row && (!data.status || data.status === 'active');
+}
+
+async function requireFriendship(playerId, targetId) {
+  const target = sanitizeId(targetId);
+  if (!target) throw new Error('friend_required');
+  if (!(await areFriends(playerId, target))) throw new Error('friendship_required');
+  return target;
+}
+
+function isRoomParticipant(room, playerId) {
+  return [room?.hostPlayerId, room?.guestPlayerId]
+    .filter(Boolean)
+    .includes(playerId);
+}
+
+function expectedPeerForPlayer(room, playerId) {
+  if (room?.hostPlayerId === playerId) return safe(room.hostPeerId);
+  if (room?.guestPlayerId === playerId) return safe(room.guestPeerId);
+  return '';
+}
+
 async function actionSocialSessionIssue(event, body) {
   if (!CFG.socialSessionSecret) throw new Error('social_session_not_configured');
 
@@ -1117,9 +1146,11 @@ function chatRoomId(a, b) {
 
 async function actionChatSend(event, body) {
   const { playerId } = await requirePlayer(event, body);
-  const toFriendId = sanitizeId(body.toFriendId || body.friendId);
+  const toFriendId = await requireFriendship(
+    playerId,
+    body.toFriendId || body.friendId
+  );
   const text = safe(body.text || '').slice(0, 1000);
-  if (!toFriendId) throw new Error('to_friend_required');
   if (!text) throw new Error('text_required');
 
   const createdAt = now();
