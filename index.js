@@ -839,6 +839,10 @@ async function actionSignalSend(event, body) {
     owner: toPeerId,
     expiresAt,
     data: {
+      seq,
+      status: 'pending',
+      deliveredAt: 0,
+      deliveryAttempts: 0,
       roomId,
       fromPlayerId: playerId,
       fromPeerId,
@@ -866,13 +870,64 @@ async function actionSignalPoll(event, body) {
   if (!peerId) throw new Error('peer_id_required');
 
   const rows = await kvPrefix(`signal:${roomId}:${peerId}:`, 200);
-  const messages = rows.map(payload).sort((a, b) => num(a.createdAt) - num(b.createdAt));
+  const messages = [];
 
-  await Promise.all(rows.map(r => kvDelete(r.pk).catch(() => null)));
+  for (const row of rows) {
+    const msg = payload(row);
 
+    if (!msg.deliveredAt) {
+      msg.status = 'delivered';
+      msg.deliveredAt = now();
+      msg.deliveryAttempts = num(msg.deliveryAttempts) + 1;
+
+      await kvPut({
+        pk: row.pk,
+        type: 'signal',
+        owner: peerId,
+        expiresAt: num(row.expires_at) || num(msg.expiresAt),
+        data: msg
+      });
+    }
+
+    messages.push(msg);
+  }
+
+  messages.sort((a, b) => num(a.createdAt) - num(b.createdAt));
   return { ok: true, messages };
 }
+async function actionSignalAck(event, body) {
+  const { playerId } = await requirePlayer(event, body);
+  const roomId = sanitizeId(body.roomId);
+  const roomSecret = safe(body.roomSecret || body.secret || body.key || '');
+  const peerId = sanitizeId(body.peerId, 140);
+  const seqs = [...new Set(
+    (Array.isArray(body.seqs) ? body.seqs : [body.seq])
+      .map(x => sanitizeId(x, 140))
+      .filter(Boolean)
+      .slice(0, 200)
+  )];
 
+  const roomRow = roomId ? await kvGet(`room:${roomId}`) : null;
+  const room = payload(roomRow);
+
+  if (!roomRow || room.roomSecretHash !== hash(roomSecret)) {
+    return { ok: false, reason: 'room_not_found' };
+  }
+  if (!isRoomParticipant(room, playerId)) {
+    return { ok: false, reason: 'room_forbidden' };
+  }
+  if (expectedPeerForPlayer(room, playerId) !== peerId) {
+    return { ok: false, reason: 'peer_identity_mismatch' };
+  }
+
+  await Promise.all(
+    seqs.map(seq =>
+      kvDelete(`signal:${roomId}:${peerId}:${seq}`).catch(() => null)
+    )
+  );
+
+  return { ok: true, acked: seqs.length };
+}
 async function actionGameInviteCreate(event, body) {
   const { playerId } = await requirePlayer(event, body);
   const toPlayerId = sanitizeId(body.toPlayerId || body.friendId);
@@ -1965,6 +2020,7 @@ const ACTIONS = {
   lan_code_register: actionLanCodeRegister,
   lan_code_resolve: actionLanCodeResolve,
   push_ack: actionPushAck,
+  signal_ack: actionSignalAck,
 
   // ===== FRIENDS MODULE (Phase A) =====
   profile_set: actionProfileSet,
