@@ -1245,6 +1245,64 @@ function chatRoomId(a, b) {
   return [sanitizeId(a), sanitizeId(b)].sort().join(':');
 }
 
+const CHAT_RETENTION_DAYS = new Set([1, 7, 30]);
+
+function normalizeRetentionDays(value) {
+  const days = Math.floor(num(value, 30));
+  return CHAT_RETENTION_DAYS.has(days) ? days : 30;
+}
+
+async function getChatPreference(room, playerId) {
+  const row = await kvGet(`chatPref:${room}:${playerId}`);
+  const data = payload(row);
+
+  return {
+    retentionDays: normalizeRetentionDays(data.retentionDays),
+    clearedBefore: num(data.clearedBefore),
+    updatedAt: num(data.updatedAt)
+  };
+}
+
+async function actionChatSettingsGet(event, body) {
+  const { playerId } = await requirePlayer(event, body);
+  const friendId = await requireFriendship(
+    playerId,
+    body.friendId || body.withFriendId
+  );
+  const room = chatRoomId(playerId, friendId);
+
+  return {
+    ok: true,
+    settings: await getChatPreference(room, playerId)
+  };
+}
+
+async function actionChatSettingsSet(event, body) {
+  const { playerId } = await requirePlayer(event, body);
+  const friendId = await requireFriendship(
+    playerId,
+    body.friendId || body.withFriendId
+  );
+  const room = chatRoomId(playerId, friendId);
+  const old = await getChatPreference(room, playerId);
+  const retentionDays = normalizeRetentionDays(body.retentionDays);
+
+  const settings = {
+    ...old,
+    retentionDays,
+    updatedAt: now()
+  };
+
+  await kvPut({
+    pk: `chatPref:${room}:${playerId}`,
+    type: 'chatPref',
+    owner: playerId,
+    data: settings
+  });
+
+  return { ok: true, settings };
+}
+
 async function actionChatSend(event, body) {
   const { playerId } = await requirePlayer(event, body);
   const toFriendId = await requireFriendship(
@@ -1324,10 +1382,18 @@ async function actionChatPoll(event, body) {
   if (!friendId) throw new Error('friend_required');
 
   const room = chatRoomId(playerId, friendId);
+  const pref = await getChatPreference(room, playerId);
+  const cutoff = Math.max(
+    pref.clearedBefore,
+    now() - pref.retentionDays * 24 * 60 * 60 * 1000
+  );
   const rows = await kvPrefix(`chat:${room}:`, 300);
   const items = rows
     .map(payload)
-    .filter(x => Math.max(num(x.createdAt), num(x.updatedAt)) > after)
+    .filter(x =>
+      num(x.createdAt) >= cutoff &&
+      Math.max(num(x.createdAt), num(x.updatedAt)) > after
+    )
     .sort((a, b) => num(a.createdAt) - num(b.createdAt))
     .slice(-80);
 
@@ -1336,15 +1402,82 @@ async function actionChatPoll(event, body) {
 
 async function actionChatClear(event, body) {
   const { playerId } = await requirePlayer(event, body);
-  const friendId = sanitizeId(body.friendId || body.withFriendId);
-  if (!friendId) throw new Error('friend_required');
-
+  const friendId = await requireFriendship(
+    playerId,
+    body.friendId || body.withFriendId
+  );
   const room = chatRoomId(playerId, friendId);
-  const rows = await kvPrefix(`chat:${room}:`, 300);
-  await Promise.all(rows.map(r => kvDelete(r.pk).catch(() => null)));
+  const old = await getChatPreference(room, playerId);
+  const clearedBefore = now();
 
-  return { ok: true, cleared: rows.length };
+  await kvPut({
+    pk: `chatPref:${room}:${playerId}`,
+    type: 'chatPref',
+    owner: playerId,
+    data: {
+      ...old,
+      clearedBefore,
+      updatedAt: clearedBefore
+    }
+  });
+
+  return {
+    ok: true,
+    scope: 'self',
+    clearedBefore
+  };
 }
+
+async function deletePrefixAll(prefix, batchSize = 300, maxBatches = 20) {
+  let deleted = 0;
+
+  for (let batch = 0; batch < maxBatches; batch++) {
+    const rows = await kvPrefix(prefix, batchSize);
+    if (!rows.length) break;
+
+    await Promise.all(rows.map(row => kvDelete(row.pk).catch(() => null)));
+    deleted += rows.length;
+
+    if (rows.length < batchSize) break;
+  }
+
+  return deleted;
+}
+
+async function actionChatPurgeBoth(event, body) {
+  const { playerId } = await requirePlayer(event, body);
+  const friendId = await requireFriendship(
+    playerId,
+    body.friendId || body.withFriendId
+  );
+  const room = chatRoomId(playerId, friendId);
+
+  const deleted = await deletePrefixAll(`chat:${room}:`);
+  const at = now();
+
+  await Promise.all([
+    kvPut({
+      pk: `chatPref:${room}:${playerId}`,
+      type: 'chatPref',
+      owner: playerId,
+      data: { retentionDays: 30, clearedBefore: at, updatedAt: at }
+    }),
+    kvPut({
+      pk: `chatPref:${room}:${friendId}`,
+      type: 'chatPref',
+      owner: friendId,
+      data: { retentionDays: 30, clearedBefore: at, updatedAt: at }
+    })
+  ]);
+
+  return {
+    ok: true,
+    scope: 'both',
+    deleted,
+    purgedAt: at
+  };
+}
+
 async function actionChatReceipt(event, body, receiptKind) {
   const { playerId } = await requirePlayer(event, body);
   const friendId = sanitizeId(body.friendId || body.withFriendId);
@@ -2021,6 +2154,9 @@ const ACTIONS = {
   lan_code_resolve: actionLanCodeResolve,
   push_ack: actionPushAck,
   signal_ack: actionSignalAck,
+  chat_settings_get: actionChatSettingsGet,
+  chat_settings_set: actionChatSettingsSet,
+  chat_purge_both: actionChatPurgeBoth,
 
   // ===== FRIENDS MODULE (Phase A) =====
   profile_set: actionProfileSet,
