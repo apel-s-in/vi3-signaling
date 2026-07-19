@@ -32,7 +32,14 @@ const CFG = {
   webPushSecret: safe(process.env.WEBPUSH_SECRET || ''),
   socialSessionSecret: safe(process.env.SOCIAL_SESSION_SECRET || ''),
   socialSessionTtlMs: Math.max(300000, Math.min(num(process.env.SOCIAL_SESSION_TTL_MS, 1200000), 3600000)),
-  allowLegacyAuth: safe(process.env.ALLOW_LEGACY_AUTH || '0') === '1'
+  allowLegacyAuth: safe(process.env.ALLOW_LEGACY_AUTH || '0') === '1',
+  chatE2eeV2: safe(process.env.CHAT_E2EE_V2 || '0') === '1',
+  allowPlaintextChat: safe(process.env.ALLOW_PLAINTEXT_CHAT || '1') === '1',
+  turnSharedSecret: safe(process.env.TURN_SHARED_SECRET || ''),
+  turnCredentialTtlSec: Math.max(
+    300,
+    Math.min(num(process.env.TURN_CREDENTIAL_TTL_SEC, 3600), 86400)
+  )
 };
 
 const TABLE = `${CFG.prefix}kv`;
@@ -1049,30 +1056,58 @@ async function actionGameInviteCreate(event, body) {
   const gameInviteId = rid('gi');
   const expiresAt = now() + CFG.gameInviteTtlMs;
 
-  await kvPut({
-    pk: `gameInvite:${gameInviteId}`,
-    type: 'gameInvite',
-    owner: toPlayerId,
-    expiresAt,
-    data: {
-      gameInviteId,
-      gameId,
-      fromPlayerId: playerId,
-      toPlayerId,
-      status: 'pending',
-      createdAt: now(),
-      updatedAt: now(),
-      expiresAt
-    }
-  });
+  const invite = {
+    gameInviteId,
+    gameId,
+    fromPlayerId: playerId,
+    toPlayerId,
+    status: 'pending',
+    createdAt: now(),
+    updatedAt: now(),
+    expiresAt
+  };
+
+  await Promise.all([
+    kvPut({
+      pk: `gameInvite:${gameInviteId}`,
+      type: 'gameInvite',
+      owner: toPlayerId,
+      expiresAt,
+      data: invite
+    }),
+    kvPut({
+      pk: `gameInviteInbox:${toPlayerId}:${gameInviteId}`,
+      type: 'gameInviteInbox',
+      owner: toPlayerId,
+      expiresAt,
+      data: invite
+    }),
+    kvPut({
+      pk: `gameInviteOutbox:${playerId}:${gameInviteId}`,
+      type: 'gameInviteOutbox',
+      owner: playerId,
+      expiresAt,
+      data: invite
+    })
+  ]);
 
   return { ok: true, gameInviteId, expiresAt };
 }
 
 async function actionGameInvitePoll(event, body) {
   const { playerId } = await requirePlayer(event, body);
-  const rows = await kvPrefix('gameInvite:', 200);
-  const items = rows.map(payload).filter(x => x.toPlayerId === playerId || x.fromPlayerId === playerId);
+  const [inbox, outbox] = await Promise.all([
+    kvPrefix(`gameInviteInbox:${playerId}:`, 100),
+    kvPrefix(`gameInviteOutbox:${playerId}:`, 100)
+  ]);
+
+  const items = [...new Map(
+    [...inbox, ...outbox]
+      .map(payload)
+      .filter(item => item?.gameInviteId)
+      .map(item => [item.gameInviteId, item])
+  ).values()].sort((a, b) => num(a.createdAt) - num(b.createdAt));
+
   return { ok: true, items };
 }
 
@@ -1089,7 +1124,30 @@ async function actionGameInviteSet(event, body, status) {
   if (status === 'accepted') inv.acceptedAt = now();
   if (status === 'rejected') inv.rejectedAt = now();
 
-  await kvPut({ pk: `gameInvite:${gameInviteId}`, type: 'gameInvite', owner: inv.toPlayerId, expiresAt: inv.expiresAt, data: inv });
+  await Promise.all([
+    kvPut({
+      pk: `gameInvite:${gameInviteId}`,
+      type: 'gameInvite',
+      owner: inv.toPlayerId,
+      expiresAt: inv.expiresAt,
+      data: inv
+    }),
+    kvPut({
+      pk: `gameInviteInbox:${inv.toPlayerId}:${gameInviteId}`,
+      type: 'gameInviteInbox',
+      owner: inv.toPlayerId,
+      expiresAt: inv.expiresAt,
+      data: inv
+    }),
+    kvPut({
+      pk: `gameInviteOutbox:${inv.fromPlayerId}:${gameInviteId}`,
+      type: 'gameInviteOutbox',
+      owner: inv.fromPlayerId,
+      expiresAt: inv.expiresAt,
+      data: inv
+    })
+  ]);
+
   return { ok: true, invite: inv };
 }
 
@@ -1266,7 +1324,8 @@ async function actionPushSend(event, body) {
       pushId,
       fromFriendId: playerId,
       kind,
-      gameId,
+      roomId: String(data.roomId || ''),
+      msgId: String(data.msgId || ''),
       roomId,
       roomSecret,
       text,
@@ -1285,9 +1344,7 @@ async function actionPushSend(event, body) {
     body: isGameInvite
       ? `Пользователь ${fromName} приглашает вас в игру Война Сердец`
       : `Пользователь ${fromName} приглашает вас в приложение`,
-    url: isGameInvite && gameId && roomId && roomSecret
-      ? `./?gcGame=${encodeURIComponent(gameId)}&room=${encodeURIComponent(roomId)}&key=${encodeURIComponent(roomSecret)}`
-      : './?openFriends=1',
+    url: './?openFriends=1',
     tag: isGameInvite ? `game-${roomId || pushId}` : `push-${pushId}`,
     requireInteraction: true,
     kind,
@@ -1439,6 +1496,330 @@ async function deleteChatRowsThrough(room, cutoff, batchSize = 300, maxBatches =
   }
 
   return deleted;
+}
+
+function normalizePublicJwk(raw) {
+  const jwk = raw && typeof raw === 'object' ? raw : {};
+  const out = {
+    kty: safe(jwk.kty),
+    crv: safe(jwk.crv),
+    x: safe(jwk.x),
+    y: safe(jwk.y),
+    ext: true
+  };
+
+  if (
+    out.kty !== 'EC' ||
+    out.crv !== 'P-256' ||
+    !/^[A-Za-z0-9_-]{40,60}$/.test(out.x) ||
+    !/^[A-Za-z0-9_-]{40,60}$/.test(out.y)
+  ) {
+    throw new Error('bad_crypto_public_key');
+  }
+
+  return out;
+}
+
+function publicKeyFingerprint(jwk) {
+  return base64url(
+    crypto.createHash('sha256')
+      .update(`${jwk.crv}:${jwk.x}:${jwk.y}`, 'utf8')
+      .digest()
+  );
+}
+
+async function getCryptoDevices(playerId, { activeOnly = true } = {}) {
+  const rows = await kvPrefix(`cryptoDevice:${sanitizeId(playerId)}:`, 30);
+  return rows
+    .map(payload)
+    .filter(item => item?.deviceId)
+    .filter(item => !activeOnly || !item.revokedAt)
+    .sort((a, b) => num(a.createdAt) - num(b.createdAt));
+}
+
+function normalizeCryptoPack(raw) {
+  const pack = raw && typeof raw === 'object' ? raw : {};
+  const envelopes = (Array.isArray(pack.envelopes) ? pack.envelopes : [])
+    .slice(0, 30)
+    .map(item => ({
+      ownerId: sanitizeId(item?.ownerId),
+      deviceId: sanitizeId(item?.deviceId, 120),
+      wrapIv: safe(item?.wrapIv),
+      wrappedKey: safe(item?.wrappedKey)
+    }));
+
+  if (
+    num(pack.version) !== 2 ||
+    safe(pack.algorithm) !== 'ECDH-P256+HKDF-SHA256+AES-256-GCM' ||
+    !sanitizeId(pack.senderDeviceId, 120) ||
+    !safe(pack.aad) ||
+    !safe(pack.iv) ||
+    !safe(pack.kdfSalt) ||
+    !safe(pack.ciphertext) ||
+    !envelopes.length
+  ) {
+    throw new Error('bad_crypto_payload');
+  }
+
+  if (
+    safe(pack.ciphertext).length > 24000 ||
+    safe(pack.aad).length > 1600 ||
+    safe(pack.kdfSalt).length > 100 ||
+    safe(pack.iv).length > 100 ||
+    envelopes.some(item =>
+      !item.ownerId ||
+      !item.deviceId ||
+      item.wrapIv.length > 100 ||
+      item.wrappedKey.length > 300
+    )
+  ) {
+    throw new Error('bad_crypto_payload_size');
+  }
+
+  return {
+    version: 2,
+    algorithm: 'ECDH-P256+HKDF-SHA256+AES-256-GCM',
+    senderDeviceId: sanitizeId(pack.senderDeviceId, 120),
+    senderPublicJwk: normalizePublicJwk(pack.senderPublicJwk),
+    senderFingerprint: safe(pack.senderFingerprint).slice(0, 100),
+    clientMsgId: sanitizeId(pack.clientMsgId, 120),
+    aad: safe(pack.aad),
+    iv: safe(pack.iv),
+    kdfSalt: safe(pack.kdfSalt),
+    ciphertext: safe(pack.ciphertext),
+    envelopes
+  };
+}
+
+async function validateCryptoPack({
+  pack,
+  playerId,
+  friendId
+}) {
+  const normalized = normalizeCryptoPack(pack);
+  const senderDevices = await getCryptoDevices(playerId);
+  const senderDevice = senderDevices.find(item =>
+    item.deviceId === normalized.senderDeviceId
+  );
+
+  if (!senderDevice) throw new Error('crypto_sender_device_required');
+
+  const actualFingerprint = publicKeyFingerprint(
+    normalized.senderPublicJwk
+  );
+
+  if (
+    actualFingerprint !== senderDevice.fingerprint ||
+    normalized.senderFingerprint !== senderDevice.fingerprint
+  ) {
+    throw new Error('crypto_sender_key_mismatch');
+  }
+
+  const [myDevices, friendDevices] = await Promise.all([
+    getCryptoDevices(playerId),
+    getCryptoDevices(friendId)
+  ]);
+
+  if (!myDevices.length || !friendDevices.length) {
+    throw new Error('crypto_devices_missing');
+  }
+
+  const expected = new Set(
+    [...myDevices, ...friendDevices]
+      .map(item => `${item.ownerId}:${item.deviceId}`)
+  );
+  const received = new Set(
+    normalized.envelopes
+      .map(item => `${item.ownerId}:${item.deviceId}`)
+  );
+
+  if (
+    expected.size !== received.size ||
+    [...expected].some(key => !received.has(key))
+  ) {
+    throw new Error('crypto_envelope_coverage_mismatch');
+  }
+
+  return normalized;
+}
+
+async function actionCryptoDeviceRegister(event, body) {
+  const { playerId } = await requirePlayer(event, body);
+  if (!CFG.chatE2eeV2) throw new Error('chat_e2ee_disabled');
+
+  const deviceId = sanitizeId(body.deviceId, 120);
+  if (!deviceId) throw new Error('crypto_device_required');
+
+  const publicJwk = normalizePublicJwk(body.publicJwk);
+  const fingerprint = publicKeyFingerprint(publicJwk);
+  const suppliedFingerprint = safe(body.fingerprint);
+
+  if (suppliedFingerprint && suppliedFingerprint !== fingerprint) {
+    throw new Error('crypto_fingerprint_mismatch');
+  }
+
+  const pk = `cryptoDevice:${playerId}:${deviceId}`;
+  const old = payload(await kvGet(pk));
+  if (
+    old?.fingerprint &&
+    old.fingerprint !== fingerprint &&
+    !old.revokedAt
+  ) {
+    throw new Error('crypto_device_key_conflict');
+  }
+
+  const data = {
+    ownerId: playerId,
+    deviceId,
+    publicJwk,
+    fingerprint,
+    label: safe(body.label || 'Устройство').slice(0, 80),
+    deviceStableId: sanitizeId(body.deviceStableId || '', 120),
+    createdAt: old.createdAt || now(),
+    updatedAt: now(),
+    revokedAt: 0
+  };
+
+  await kvPut({
+    pk,
+    type: 'cryptoDevice',
+    owner: playerId,
+    data
+  });
+
+  return { ok: true, device: data };
+}
+
+async function actionCryptoDeviceList(event, body) {
+  const {
+    playerId,
+    friendId
+  } = await requireFriendContext(event, body);
+
+  const [mine, peer] = await Promise.all([
+    getCryptoDevices(playerId),
+    getCryptoDevices(friendId)
+  ]);
+
+  return {
+    ok: true,
+    items: [...mine, ...peer].map(item => ({
+      ownerId: item.ownerId,
+      deviceId: item.deviceId,
+      publicJwk: item.publicJwk,
+      fingerprint: item.fingerprint,
+      label: item.label,
+      createdAt: item.createdAt
+    }))
+  };
+}
+
+async function actionCryptoDeviceRevoke(event, body) {
+  const { playerId } = await requirePlayer(event, body);
+  const deviceId = sanitizeId(body.deviceId, 120);
+  if (!deviceId) throw new Error('crypto_device_required');
+
+  const pk = `cryptoDevice:${playerId}:${deviceId}`;
+  const row = await kvGet(pk);
+  const data = payload(row);
+  if (!row || data.ownerId !== playerId) {
+    throw new Error('crypto_device_not_found');
+  }
+
+  data.revokedAt = now();
+  data.updatedAt = data.revokedAt;
+
+  await kvPut({
+    pk,
+    type: 'cryptoDevice',
+    owner: playerId,
+    data
+   const createdAt = now();
+  const msgId = rid('chat');
+  const clientMsgId = sanitizeId(
+    body.clientMsgId || cryptoPack.clientMsgId,
+    120
+  );
+  const msg = {
+    msgId,
+    clientMsgId,
+    room,
+    fromFriendId: playerId,
+    toFriendId,
+    cryptoVersion: 2,
+    crypto: cryptoPack,
+    createdAt,
+    updatedAt: createdAt,
+    deliveredAt: 0,
+    readAt: 0,
+    deletedAt: 0
+  };
+
+  const chatPk =
+    `chat:${room}:${createdAt.toString().padStart(13, '0')}:${msgId}`;
+
+  await kvPut({
+    pk: chatPk,
+    type: 'chat',
+    owner: room,
+    expiresAt: createdAt + 30 * 24 * 60 * 60 * 1000,
+    data: msg
+  });
+
+  const roomState = await getChatRoomState(room);
+  if (roomState.purgeBefore >= createdAt) {
+    await kvDelete(chatPk).catch(() => null);
+    return {
+      ok: false,
+      reason: 'chat_purged_during_send',
+      retryable: true
+    };
+  }
+
+  const pushId = rid('push');
+  const expiresAt = createdAt + 7 * 24 * 60 * 60 * 1000;
+
+  await kvPut({
+    pk: `push:${toFriendId}:${createdAt.toString().padStart(13, '0')}_${pushId}`,
+    type: 'push',
+    owner: toFriendId,
+    expiresAt,
+    data: {
+      pushId,
+      msgId,
+      fromFriendId: playerId,
+      kind: 'CHAT_MESSAGE',
+      cryptoVersion: 2,
+      createdAt,
+      expiresAt
+    }
+  });
+
+  const profile = payload(await kvGet(`profile:${playerId}`));
+  const fromName = safe(
+    profile.displayName || body.displayName || 'Друг'
+  ).slice(0, 80);
+
+  const webPush = await sendSystemWebPush({
+    toPlayerId: toFriendId,
+    title: '💬 Новое защищённое сообщение',
+    body: `Пользователь ${fromName} прислал вам сообщение`,
+    url: `./?openFriends=1&chatWith=${encodeURIComponent(playerId)}`,
+    tag: `chat-${room}`,
+    requireInteraction: true,
+    kind: 'CHAT_MESSAGE',
+    fromFriendId: playerId,
+    msgId
+  });
+
+  return {
+    ok: true,
+    msgId,
+    clientMsgId,
+    cryptoVersion: 2,
+    createdAt,
+    webPush
+  };
 }
 
 async function actionChatSettingsGet(event, body) {
@@ -1736,6 +2117,108 @@ async function actionChatDelete(event, body) {
   }
 
   return { ok: true, deleted };
+}
+
+async function actionChatUpdateV2(event, body) {
+  if (!CFG.chatE2eeV2) throw new Error('chat_e2ee_disabled');
+
+  const {
+    playerId,
+    friendId,
+    room
+  } = await requireFriendContext(event, body);
+
+  const msgId = sanitizeId(body.msgId, 96);
+  if (!msgId) throw new Error('msg_required');
+
+  const row = await findChatRow(room, msgId);
+  const msg = payload(row);
+  if (!row || num(msg.cryptoVersion) !== 2) {
+    throw new Error('chat_message_not_found');
+  }
+
+  const participants = new Set([
+    safe(msg.fromFriendId),
+    safe(msg.toFriendId)
+  ]);
+  if (!participants.has(playerId) || !participants.has(friendId)) {
+    throw new Error('chat_message_forbidden');
+  }
+
+  msg.crypto = await validateCryptoPack({
+    pack: body.crypto,
+    playerId,
+    friendId
+  });
+  msg.updatedAt = now();
+
+  await kvPut({
+    pk: row.pk,
+    type: 'chat',
+    owner: room,
+    expiresAt: num(row.expires_at) ||
+      num(msg.createdAt) + 30 * 24 * 60 * 60 * 1000,
+    data: msg
+  });
+
+  return {
+    ok: true,
+    updated: 1,
+    cryptoVersion: 2,
+    at: msg.updatedAt
+  };
+}
+
+async function actionChatDeleteV2(event, body) {
+  if (!CFG.chatE2eeV2) throw new Error('chat_e2ee_disabled');
+
+  const {
+    playerId,
+    friendId,
+    room
+  } = await requireFriendContext(event, body);
+
+  const msgId = sanitizeId(body.msgId, 96);
+  if (!msgId) throw new Error('msg_required');
+
+  const row = await findChatRow(room, msgId);
+  const msg = payload(row);
+  if (!row || num(msg.cryptoVersion) !== 2) {
+    throw new Error('chat_message_not_found');
+  }
+
+  const participants = new Set([
+    safe(msg.fromFriendId),
+    safe(msg.toFriendId)
+  ]);
+  if (!participants.has(playerId) || !participants.has(friendId)) {
+    throw new Error('chat_message_forbidden');
+  }
+
+  msg.crypto = await validateCryptoPack({
+    pack: body.crypto,
+    playerId,
+    friendId
+  });
+  msg.deletedAt = Math.max(num(body.deletedAt), now());
+  msg.updatedAt = msg.deletedAt;
+
+  await kvPut({
+    pk: row.pk,
+    type: 'chat',
+    owner: room,
+    expiresAt: num(row.expires_at) ||
+      num(msg.createdAt) + 30 * 24 * 60 * 60 * 1000,
+    data: msg
+  });
+
+  return {
+    ok: true,
+    deleted: 1,
+    tombstone: true,
+    cryptoVersion: 2,
+    at: msg.deletedAt
+  };
 }
 
 async function actionChatReact(event, body) {
@@ -2434,6 +2917,9 @@ const ACTIONS = {
   lan_code_resolve: actionLanCodeResolve,
   push_ack: actionPushAck,
   signal_ack: actionSignalAck,
+  crypto_device_register: actionCryptoDeviceRegister,
+  crypto_device_list: actionCryptoDeviceList,
+  crypto_device_revoke: actionCryptoDeviceRevoke,
   chat_settings_get: actionChatSettingsGet,
   chat_settings_set: actionChatSettingsSet,
   chat_purge_both: actionChatPurgeBoth,
@@ -2447,6 +2933,9 @@ const ACTIONS = {
   push_send: actionPushSend,
   push_poll: actionPushPoll,
   chat_send: actionChatSend,
+  chat_send_v2: actionChatSendV2,
+  chat_update_v2: actionChatUpdateV2,
+  chat_delete_v2: actionChatDeleteV2,
   chat_poll: actionChatPoll,
   chat_clear: actionChatClear,
   chat_delivery: actionChatDelivered,
@@ -2479,6 +2968,9 @@ exports.handler = async event => {
         vapidPublicConfigured: !!CFG.vapidPublicKey,
         socialSessionConfigured: !!CFG.socialSessionSecret,
         allowLegacyAuth: CFG.allowLegacyAuth,
+        chatE2eeV2: CFG.chatE2eeV2,
+        allowPlaintextChat: CFG.allowPlaintextChat,
+        temporaryTurnConfigured: !!CFG.turnSharedSecret,
         ts: now()
       });
     }
