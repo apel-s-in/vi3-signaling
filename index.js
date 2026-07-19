@@ -1094,7 +1094,6 @@ async function sendSystemWebPush({ toPlayerId, title, body, url = './', tag = 'v
       },
       body: JSON.stringify({
         action: 'send_to_player',
-        adminSecret: CFG.webPushSecret,
         playerId: toPlayerId,
         title,
         body,
