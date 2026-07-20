@@ -399,14 +399,12 @@ async function kvCompareAndPut({
   if (!row?.pk) throw new Error('cas_row_required');
 
   const expectedUpdatedAt = num(row.updated_at);
-  const nextUpdatedAt = Math.max(now(), expectedUpdatedAt + 1);
-  const mutationId = rid('cas');
-  const nextData = {
-    ...data,
-    _lastMutationId: mutationId
-  };
+  const nextUpdatedAt = Math.max(
+    now(),
+    expectedUpdatedAt + 1
+  );
 
-  await query(`
+  const result = await query(`
     DECLARE $pk AS Utf8;
     DECLARE $expected_updated_at AS Uint64;
     DECLARE $type AS Utf8;
@@ -423,7 +421,8 @@ async function kvCompareAndPut({
       expires_at = $expires_at,
       payload_json = $payload_json
     WHERE pk = $pk
-      AND updated_at = $expected_updated_at;
+      AND updated_at = $expected_updated_at
+    RETURNING pk, updated_at;
   `, {
     '$pk': tvUtf8(row.pk),
     '$expected_updated_at': tvUint64(expectedUpdatedAt),
@@ -431,11 +430,14 @@ async function kvCompareAndPut({
     '$owner': tvUtf8(owner),
     '$next_updated_at': tvUint64(nextUpdatedAt),
     '$expires_at': tvUint64(expiresAt),
-    '$payload_json': tvUtf8(JSON.stringify(nextData))
+    '$payload_json': tvUtf8(JSON.stringify(data || {}))
   });
 
-  const check = await kvGet(row.pk);
-  return payload(check)?._lastMutationId === mutationId;
+  const changed = rowsOf(result)[0] || null;
+
+  return !!changed &&
+    changed.pk === row.pk &&
+    num(changed.updated_at) === nextUpdatedAt;
 }
 
 async function kvDelete(pk) {
@@ -466,6 +468,60 @@ async function kvPrefix(prefix, limit = 100) {
 
   const t = now();
   return rowsOf(res).filter(r => !num(r.expires_at) || num(r.expires_at) >= t);
+}
+
+async function enforceRateLimit({
+  scope,
+  actor,
+  limit,
+  windowMs
+}) {
+  const cleanScope = sanitizeId(scope, 60);
+  const cleanActor = safe(actor);
+
+  if (!cleanScope || !cleanActor) {
+    throw new Error('rate_limit_identity_required');
+  }
+
+  const duration = Math.max(
+    1000,
+    Math.min(num(windowMs), 24 * 60 * 60 * 1000)
+  );
+  const max = Math.max(1, Math.min(num(limit), 1000));
+  const at = now();
+  const bucket = Math.floor(at / duration);
+  const actorHash = hash(`rate:${cleanActor}`).slice(0, 24);
+  const prefix =
+    `rate:${cleanScope}:${actorHash}:${bucket}:`;
+  const pk = `${prefix}${rid('hit')}`;
+  const expiresAt = (bucket + 1) * duration + 60000;
+
+  await kvPut({
+    pk,
+    type: 'rateLimit',
+    owner: actorHash,
+    expiresAt,
+    data: {
+      scope: cleanScope,
+      at
+    }
+  });
+
+  const rows = await kvPrefix(prefix, max + 1);
+
+  if (rows.length > max) {
+    await kvDelete(pk).catch(() => null);
+
+    const error = new Error('rate_limit_exceeded');
+    error.httpStatus = 429;
+    throw error;
+  }
+
+  return {
+    ok: true,
+    remaining: Math.max(0, max - rows.length),
+    resetAt: (bucket + 1) * duration
+  };
 }
 
 async function areFriends(a, b) {
@@ -694,6 +750,14 @@ async function actionFriendStatus(event, body) {
 
 async function actionFriendInviteCreate(event, body) {
   const { playerId } = await requirePlayer(event, body);
+
+  await enforceRateLimit({
+    scope: 'friend_invite',
+    actor: playerId,
+    limit: 10,
+    windowMs: 60 * 60 * 1000
+  });
+
   const inviteId = rid('fi');
   const secret = crypto.randomBytes(16).toString('hex');
   const expiresAt = now() + CFG.friendInviteTtlMs;
@@ -1350,6 +1414,13 @@ async function sendSystemWebPush({
 async function actionPushSend(event, body) {
   const { playerId } = await requirePlayer(event, body);
 
+  await enforceRateLimit({
+    scope: 'push_send',
+    actor: playerId,
+    limit: 20,
+    windowMs: 60 * 1000
+  });
+
   const toFriendId = await requireFriendship(
     playerId,
     body.toFriendId || body.toPlayerId
@@ -1407,6 +1478,12 @@ async function actionPushSend(event, body) {
 
 async function actionPushPoll(event, body) {
   const { playerId } = await requirePlayer(event, body);
+  const deviceId = sanitizeId(body.deviceId, 120);
+
+  if (!deviceId) {
+    throw new Error('push_device_required');
+  }
+
   const rows = await kvPrefix(`push:${playerId}:`, 100);
   const t = now();
   const items = [];
@@ -1426,49 +1503,72 @@ async function actionPushPoll(event, body) {
       continue;
     }
 
-    if (!item.deliveredAt) {
-      item.status = 'delivered';
-      item.deliveredAt = t;
-      item.deliveryAttempts = num(item.deliveryAttempts) + 1;
+    const pushId = sanitizeId(item.pushId, 120);
+    if (!pushId) continue;
 
-      await kvPut({
-        pk: row.pk,
-        type: 'push',
-        owner: playerId,
-        expiresAt: num(row.expires_at) || num(item.expiresAt),
-        data: item
-      });
-    }
+    const ack = await kvGet(
+      `pushAck:${playerId}:${deviceId}:${pushId}`
+    );
+
+    if (ack) continue;
 
     items.push(item);
   }
 
-  items.sort((a, b) => num(a.createdAt) - num(b.createdAt));
-  return { ok: true, items };
+  items.sort((a, b) =>
+    num(a.createdAt) - num(b.createdAt)
+  );
+
+  return {
+    ok: true,
+    deviceId,
+    items
+  };
 }
 
 async function actionPushAck(event, body) {
   const { playerId } = await requirePlayer(event, body);
-  const ids = new Set(
-    (Array.isArray(body.pushIds) ? body.pushIds : [body.pushId])
-      .map(x => sanitizeId(x, 120))
-      .filter(Boolean)
-      .slice(0, 100)
-  );
+  const deviceId = sanitizeId(body.deviceId, 120);
 
-  if (!ids.size) return { ok: true, acked: 0 };
-
-  const rows = await kvPrefix(`push:${playerId}:`, 100);
-  let acked = 0;
-
-  for (const row of rows) {
-    const item = payload(row);
-    if (!ids.has(sanitizeId(item.pushId, 120))) continue;
-    await kvDelete(row.pk).catch(() => null);
-    acked++;
+  if (!deviceId) {
+    throw new Error('push_device_required');
   }
 
-  return { ok: true, acked };
+  const ids = [...new Set(
+    (Array.isArray(body.pushIds)
+      ? body.pushIds
+      : [body.pushId])
+      .map(value => sanitizeId(value, 120))
+      .filter(Boolean)
+  )].slice(0, 100);
+
+  if (!ids.length) {
+    return { ok: true, acked: 0 };
+  }
+
+  const at = now();
+  const expiresAt = at + 7 * 24 * 60 * 60 * 1000;
+
+  await Promise.all(ids.map(pushId =>
+    kvPut({
+      pk: `pushAck:${playerId}:${deviceId}:${pushId}`,
+      type: 'pushAck',
+      owner: playerId,
+      expiresAt,
+      data: {
+        playerId,
+        deviceId,
+        pushId,
+        ackedAt: at
+      }
+    })
+  ));
+
+  return {
+    ok: true,
+    deviceId,
+    acked: ids.length
+  };
 }
 
 function chatRoomId(a, b) {
@@ -1801,7 +1901,17 @@ async function validateCryptoPack({
 
 async function actionCryptoDeviceRegister(event, body) {
   const { playerId } = await requirePlayer(event, body);
-  if (!CFG.chatE2eeV2) throw new Error('chat_e2ee_disabled');
+
+  await enforceRateLimit({
+    scope: 'crypto_register',
+    actor: playerId,
+    limit: 8,
+    windowMs: 10 * 60 * 1000
+  });
+
+  if (!CFG.chatE2eeV2) {
+    throw new Error('chat_e2ee_disabled');
+  }
 
   const deviceId = sanitizeId(body.deviceId, 120);
   if (!deviceId) throw new Error('crypto_device_required');
@@ -1972,6 +2082,14 @@ async function actionCryptoDeviceSelfList(event, body) {
 
 async function actionCryptoDeviceReset(event, body) {
   const { playerId } = await requirePlayer(event, body);
+
+  await enforceRateLimit({
+    scope: 'crypto_reset',
+    actor: playerId,
+    limit: 3,
+    windowMs: 24 * 60 * 60 * 1000
+  });
+
   const rows = await kvPrefix(`cryptoDevice:${playerId}:`, 100);
   const at = now();
   let revoked = 0;
@@ -2057,7 +2175,6 @@ async function requireChatMessageContext(event, body, {
 
 function publicChatMessage(message, receipt = null) {
   const {
-    _lastMutationId,
     deliveredAt: legacyDeliveredAt,
     readAt: legacyReadAt,
     ...data
@@ -2137,6 +2254,13 @@ async function actionChatSendV2(event, body) {
     room
   } = await requireFriendContext(event, body, {
     friendFields: ['toFriendId', 'friendId']
+  });
+
+  await enforceRateLimit({
+    scope: 'chat_send',
+    actor: playerId,
+    limit: 40,
+    windowMs: 60 * 1000
   });
 
   const requestedClientMsgId = sanitizeId(
@@ -3355,7 +3479,7 @@ exports.handler = async event => {
 
     if (!status) {
       if (
-        /RESOURCE_EXHAUSTED|resource_exhausted|Too many|overload/i.test(msg)
+        /RESOURCE_EXHAUSTED|resource_exhausted|Too many|overload|rate_limit/i.test(msg)
       ) {
         status = 429;
       } else if (
