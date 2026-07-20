@@ -1461,10 +1461,10 @@ async function actionPushSend(event, body) {
   const isGameInvite = kind === 'GAME_INVITE';
   const webPush = await sendSystemWebPush({
     toPlayerId: toFriendId,
-    title: isGameInvite ? '🎮 Приглашение в игру' : '🔔 Приглашение в приложение',
+    title: `${isGameInvite ? '🎮' : '🔔'} ${fromName}`,
     body: isGameInvite
-      ? `Пользователь ${fromName} приглашает вас в игру Война Сердец`
-      : `Пользователь ${fromName} приглашает вас в приложение`,
+      ? 'Приглашение: Война Сердец'
+      : 'Ждёт вас в приложении',
     url: './?openFriends=1',
     tag: isGameInvite ? `game-${roomId || pushId}` : `push-${pushId}`,
     requireInteraction: true,
@@ -2403,8 +2403,8 @@ async function actionChatSendV2(event, body) {
 
   const webPush = await sendSystemWebPush({
     toPlayerId: toFriendId,
-    title: '💬 Новое защищённое сообщение',
-    body: `Пользователь ${fromName} прислал вам сообщение`,
+    title: `💬 ${fromName}`,
+    body: 'Новое сообщение',
     url: `./?openFriends=1&chatWith=${encodeURIComponent(playerId)}`,
     tag: `chat-${room}`,
     requireInteraction: true,
@@ -2862,8 +2862,8 @@ async function actionVoiceCallCreate(event, body) {
 
   const webPush = await sendSystemWebPush({
     toPlayerId: toFriendId,
-    title: '📞 Входящий звонок',
-    body: `Пользователь ${fromName} звонит вам`,
+    title: `📞 ${fromName}`,
+    body: 'Входящий звонок',
     url: './?openFriends=1',
     tag: `voice-${roomRes.roomId}`,
     requireInteraction: true,
