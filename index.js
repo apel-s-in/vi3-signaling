@@ -3093,7 +3093,12 @@ async function actionLeaderboardGet(event, body) {
        wins: p.wins || 0,
        matches: p.matches || 0
     }));
-  return { ok: true, leaders };
+  return {
+    ok: true,
+    version: 1,
+    legacyFrozen: true,
+    leaders
+  };
 }
 
 async function actionRtcConfig(event, body) {
@@ -3392,7 +3397,6 @@ const ACTIONS = {
   game_invite_accept: (e, b) => actionGameInviteSet(e, b, 'accepted'),
   game_invite_reject: (e, b) => actionGameInviteSet(e, b, 'rejected'),
   game_invite_cancel: (e, b) => actionGameInviteSet(e, b, 'cancelled'),
-  match_submit_result: actionMatchSubmit,
   leaderboard_get: actionLeaderboardGet,
   rtc_config: actionRtcConfig,
   webpush_config: actionWebPushConfig,
