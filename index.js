@@ -31,10 +31,14 @@ const CFG = {
   webPushFunctionUrl: safe(process.env.WEBPUSH_FUNCTION_URL || ''),
   webPushSecret: safe(process.env.WEBPUSH_SECRET || ''),
   socialSessionSecret: safe(process.env.SOCIAL_SESSION_SECRET || ''),
-  socialSessionTtlMs: Math.max(300000, Math.min(num(process.env.SOCIAL_SESSION_TTL_MS, 1200000), 3600000)),
-  allowLegacyAuth: safe(process.env.ALLOW_LEGACY_AUTH || '0') === '1',
+  socialSessionTtlMs: Math.max(
+    300000,
+    Math.min(
+      num(process.env.SOCIAL_SESSION_TTL_MS, 1200000),
+      3600000
+    )
+  ),
   chatE2eeV2: safe(process.env.CHAT_E2EE_V2 || '0') === '1',
-  allowPlaintextChat: safe(process.env.ALLOW_PLAINTEXT_CHAT || '0') === '1',
   turnSharedSecret: safe(process.env.TURN_SHARED_SECRET || ''),
   turnCredentialTtlSec: Math.max(
     300,
@@ -135,7 +139,7 @@ function headerValue(event, name) {
 }
 
 async function verifyYandexOAuth(event, body) {
-  const token = headerValue(event, 'x-yandex-oauth') || safe(body.yandexOAuthToken || '');
+  const token = headerValue(event, 'x-yandex-oauth');
   if (!token) throw new Error('yandex_oauth_required');
 
   const response = await fetch('https://login.yandex.ru/info?format=json', {
@@ -596,41 +600,29 @@ async function actionSocialSessionIssue(event, body) {
 }
 
 async function requirePlayer(event, body) {
-  const sessionToken =
-    headerValue(event, 'x-vi3-session') ||
-    safe(body.socialSession || '');
+  const token = headerValue(event, 'x-vi3-session');
+  if (!token) throw new Error('social_session_required');
 
-  if (sessionToken) {
-    const claims = verifySocialSession(sessionToken);
-    const requestedId = sanitizeId(body.playerId || body.userId || '');
+  const claims = verifySocialSession(token);
+  const requestedId = sanitizeId(
+    body.playerId ||
+    body.userId ||
+    ''
+  );
 
-    if (requestedId && requestedId !== claims.sub) {
-      throw new Error('player_identity_mismatch');
-    }
-
-    const row = await kvGet(`player:${claims.sub}`);
-    if (!row) throw new Error('player_not_registered');
-
-    return {
-      playerId: claims.sub,
-      sessionId: safe(claims.jti),
-      expiresAt: num(claims.exp),
-      authVersion: 2
-    };
+  if (requestedId && requestedId !== claims.sub) {
+    throw new Error('player_identity_mismatch');
   }
 
-  if (!CFG.allowLegacyAuth) throw new Error('social_session_required');
+  const row = await kvGet(`player:${claims.sub}`);
+  if (!row) throw new Error('player_not_registered');
 
-  const playerId = sanitizeId(body.playerId || body.userId);
-  const clientSecret = safe(body.clientSecret || body.secret || '');
-  if (!playerId || !clientSecret) throw new Error('social_session_required');
-
-  const row = await kvGet(`player:${playerId}`);
-  const player = payload(row);
-  if (!row || !player.clientSecretHash) throw new Error('bad_player_secret');
-  if (hash(clientSecret) !== player.clientSecretHash) throw new Error('bad_player_secret');
-
-  return { playerId, authVersion: 1 };
+  return {
+    playerId: claims.sub,
+    sessionId: safe(claims.jti),
+    expiresAt: num(claims.exp),
+    authVersion: 2
+  };
 }
 
 async function actionPlayerRegister(event, body) {
@@ -1320,7 +1312,6 @@ async function sendSystemWebPush({
   kind = '',
   fromFriendId = '',
   gameId = '',
-  roomId = '',
   msgId = '',
   callId = ''
 } = {}) {
@@ -1344,7 +1335,6 @@ async function sendSystemWebPush({
         kind,
         fromFriendId,
         gameId,
-        roomId,
         msgId,
         callId
       })
@@ -1409,8 +1399,7 @@ async function actionPushSend(event, body) {
     requireInteraction: true,
     kind,
     fromFriendId: playerId,
-    gameId,
-    roomId
+    gameId
   });
 
   return { ok: true, pushId, webPush };
@@ -1557,6 +1546,11 @@ async function deleteChatRowsThrough(room, cutoff, batchSize = 300, maxBatches =
           message.clientMsgId && message.fromFriendId
             ? kvDelete(
               `chatClient:${room}:${message.fromFriendId}:${message.clientMsgId}`
+            ).catch(() => null)
+            : Promise.resolve(),
+          message.msgId
+            ? kvDelete(
+              `chatReceipt:${room}:${message.msgId}`
             ).catch(() => null)
             : Promise.resolve()
         ];
@@ -1830,15 +1824,62 @@ async function actionCryptoDeviceRegister(event, body) {
     throw new Error('crypto_device_key_conflict');
   }
 
+  const deviceStableId = sanitizeId(
+    body.deviceStableId || '',
+    120
+  );
+  const registeredAt = now();
+
+  if (deviceStableId) {
+    const rows = await kvPrefix(
+      `cryptoDevice:${playerId}:`,
+      100
+    );
+
+    await Promise.all(rows.map(async row => {
+      const item = payload(row);
+
+      if (
+        !item.deviceId ||
+        item.deviceId === deviceId ||
+        item.revokedAt ||
+        item.deviceStableId !== deviceStableId
+      ) return;
+
+      item.revokedAt = registeredAt;
+      item.updatedAt = registeredAt;
+
+      await kvPut({
+        pk: row.pk,
+        type: 'cryptoDevice',
+        owner: playerId,
+        expiresAt:
+          registeredAt +
+          30 * 24 * 60 * 60 * 1000,
+        data: item
+      });
+    }));
+  }
+
+  const active = await getCryptoDevices(playerId);
+  if (
+    !active.some(item => item.deviceId === deviceId) &&
+    active.length >= 12
+  ) {
+    const error = new Error('crypto_device_limit');
+    error.httpStatus = 409;
+    throw error;
+  }
+
   const data = {
     ownerId: playerId,
     deviceId,
     publicJwk,
     fingerprint,
     label: safe(body.label || 'Устройство').slice(0, 80),
-    deviceStableId: sanitizeId(body.deviceStableId || '', 120),
-    createdAt: old.createdAt || now(),
-    updatedAt: now(),
+    deviceStableId,
+    createdAt: old.createdAt || registeredAt,
+    updatedAt: registeredAt,
     revokedAt: 0
   };
 
@@ -1962,36 +2003,17 @@ async function actionCryptoDeviceReset(event, body) {
 }
 
 async function findChatRow(room, msgId) {
-  const indexRow = await kvGet(`chatById:${room}:${msgId}`);
+  const indexRow = await kvGet(
+    `chatById:${room}:${msgId}`
+  );
   const index = payload(indexRow);
 
-  if (index?.chatPk) {
-    const row = await kvGet(index.chatPk);
-    if (row && payload(row)?.msgId === msgId) return row;
-  }
+  if (!index?.chatPk) return null;
 
-  // Временный fallback для сообщений, созданных до индекса.
-  const rows = await kvPrefix(`chat:${room}:`, 300);
-  const row = rows.find(item => payload(item)?.msgId === msgId) || null;
-
-  if (row) {
-    const message = payload(row);
-    await kvPut({
-      pk: `chatById:${room}:${msgId}`,
-      type: 'chatById',
-      owner: room,
-      expiresAt: num(row.expires_at),
-      data: {
-        room,
-        msgId,
-        chatPk: row.pk,
-        clientMsgId: safe(message.clientMsgId),
-        createdAt: num(message.createdAt)
-      }
-    }).catch(() => null);
-  }
-
-  return row;
+  const row = await kvGet(index.chatPk);
+  return row && payload(row)?.msgId === msgId
+    ? row
+    : null;
 }
 
 async function requireChatMessageContext(event, body, {
@@ -2031,6 +2053,77 @@ async function requireChatMessageContext(event, body, {
     message,
     msgId
   };
+}
+
+function publicChatMessage(message, receipt = null) {
+  const {
+    _lastMutationId,
+    deliveredAt: legacyDeliveredAt,
+    readAt: legacyReadAt,
+    ...data
+  } = message || {};
+
+  return {
+    ...data,
+    deliveredAt: Math.max(
+      num(receipt?.deliveredAt),
+      num(legacyDeliveredAt)
+    ),
+    readAt: Math.max(
+      num(receipt?.readAt),
+      num(legacyReadAt)
+    )
+  };
+}
+
+async function getChatReceiptMap(room) {
+  const rows = await kvPrefix(
+    `chatReceipt:${room}:`,
+    300
+  );
+
+  return new Map(rows
+    .map(payload)
+    .filter(item => item?.msgId)
+    .map(item => [item.msgId, item]));
+}
+
+async function putChatReceipt({
+  room,
+  message,
+  playerId,
+  kind
+}) {
+  const pk = `chatReceipt:${room}:${message.msgId}`;
+  const old = payload(await kvGet(pk));
+  const at = now();
+
+  const receipt = {
+    room,
+    msgId: message.msgId,
+    fromFriendId: message.fromFriendId,
+    toFriendId: message.toFriendId,
+    deliveredAt:
+      old.deliveredAt ||
+      (kind === 'delivered' || kind === 'read' ? at : 0),
+    readAt:
+      old.readAt ||
+      (kind === 'read' ? at : 0),
+    updatedBy: playerId,
+    updatedAt: at
+  };
+
+  await kvPut({
+    pk,
+    type: 'chatReceipt',
+    owner: message.toFriendId,
+    expiresAt:
+      num(message.createdAt) +
+      30 * 24 * 60 * 60 * 1000,
+    data: receipt
+  });
+
+  return receipt;
 }
 
 async function actionChatSendV2(event, body) {
@@ -2096,8 +2189,6 @@ async function actionChatSendV2(event, body) {
     revision: 1,
     createdAt,
     updatedAt: createdAt,
-    deliveredAt: 0,
-    readAt: 0,
     deletedAt: 0
   };
 
@@ -2251,39 +2342,51 @@ async function actionChatPoll(event, body) {
     roomState.purgeBefore,
     now() - pref.retentionDays * 24 * 60 * 60 * 1000
   );
-  const rows = await kvPrefix(`chat:${room}:`, 300);
+  const [rows, receipts] = await Promise.all([
+    kvPrefix(`chat:${room}:`, 300),
+    getChatReceiptMap(room)
+  ]);
+
   const items = rows
     .map(payload)
-    .filter(x =>
-      num(x.createdAt) >= cutoff &&
-      Math.max(num(x.createdAt), num(x.updatedAt)) > after
+    .filter(message =>
+      num(message.cryptoVersion) === 2 &&
+      num(message.createdAt) >= cutoff &&
+      Math.max(
+        num(message.createdAt),
+        num(message.updatedAt),
+        num(receipts.get(message.msgId)?.updatedAt)
+      ) > after
     )
-    .sort((a, b) => num(a.createdAt) - num(b.createdAt))
-    .slice(-80);
+    .sort((a, b) =>
+      num(a.createdAt) - num(b.createdAt)
+    )
+    .slice(-80)
+    .map(message =>
+      publicChatMessage(
+        message,
+        receipts.get(message.msgId)
+      )
+    );
 
   return { ok: true, items };
 }
 
 async function actionChatMessageGet(event, body) {
   const {
-    playerId,
-    friendId,
     room,
     message
   } = await requireChatMessageContext(event, body, {
     cryptoVersion: 2
   });
 
-  if (
-    ![message.fromFriendId, message.toFriendId].includes(playerId) ||
-    ![message.fromFriendId, message.toFriendId].includes(friendId)
-  ) {
-    throw new Error('chat_message_forbidden');
-  }
+  const receipt = payload(await kvGet(
+    `chatReceipt:${room}:${message.msgId}`
+  ));
 
   return {
     ok: true,
-    message
+    message: publicChatMessage(message, receipt)
   };
 }
 
@@ -2357,48 +2460,44 @@ async function actionChatPurgeBoth(event, body) {
 }
 
 async function actionChatReceipt(event, body, receiptKind) {
-  const { playerId } = await requirePlayer(event, body);
-  const friendId = await requireFriendship(
+  const {
     playerId,
-    body.friendId || body.withFriendId
-  );
+    friendId,
+    room
+  } = await requireFriendContext(event, body);
+
   const msgId = sanitizeId(body.msgId || '', 96);
+  let messages = [];
 
-  const room = chatRoomId(playerId, friendId);
-  const rows = await kvPrefix(`chat:${room}:`, 300);
-  const at = now();
-  let updated = 0;
-
-  for (const row of rows) {
-    const msg = payload(row);
-    if (!msg || msg.fromFriendId !== friendId || msg.toFriendId !== playerId) continue;
-    if (msgId && msg.msgId !== msgId) continue;
-
-    if (receiptKind === 'delivered') {
-      if (msg.deliveredAt) continue;
-      msg.deliveredAt = at;
-    }
-
-    if (receiptKind === 'read') {
-      if (msg.readAt) continue;
-      msg.deliveredAt = msg.deliveredAt || at;
-      msg.readAt = at;
-    }
-
-    msg.updatedAt = at;
-    await kvPut({
-      pk: row.pk,
-      type: 'chat',
-      owner: room,
-      expiresAt: num(row.expires_at) || (num(msg.createdAt) + 30 * 24 * 60 * 60 * 1000),
-      data: msg
-    });
-
-    updated++;
-    if (msgId) break;
+  if (msgId) {
+    const row = await findChatRow(room, msgId);
+    const message = payload(row);
+    if (row) messages = [message];
+  } else {
+    messages = (await kvPrefix(`chat:${room}:`, 300))
+      .map(payload);
   }
 
-  return { ok: true, updated, at };
+  const incoming = messages.filter(message =>
+    num(message.cryptoVersion) === 2 &&
+    message.fromFriendId === friendId &&
+    message.toFriendId === playerId
+  );
+
+  await Promise.all(incoming.map(message =>
+    putChatReceipt({
+      room,
+      message,
+      playerId,
+      kind: receiptKind
+    })
+  ));
+
+  return {
+    ok: true,
+    updated: incoming.length,
+    at: now()
+  };
 }
 
 async function actionChatDelivered(event, body) {
@@ -3233,9 +3332,9 @@ exports.handler = async event => {
         webPushConfigured: !!(CFG.webPushFunctionUrl && CFG.webPushSecret),
         vapidPublicConfigured: !!CFG.vapidPublicKey,
         socialSessionConfigured: !!CFG.socialSessionSecret,
-        allowLegacyAuth: CFG.allowLegacyAuth,
+        authMode: 'signed-social-session-only',
         chatE2eeV2: CFG.chatE2eeV2,
-        allowPlaintextChat: CFG.allowPlaintextChat,
+        chatMode: 'e2ee-v2-only',
         temporaryTurnConfigured: !!CFG.turnSharedSecret,
         ts: now()
       });
