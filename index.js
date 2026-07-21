@@ -3015,70 +3015,6 @@ async function actionVoiceCallEnd(event, body) {
   return { ok: true, ended: true };
 }
 
-async function actionMatchSubmit(event, body) {
-  const { playerId } = await requirePlayer(event, body);
-  const matchId = sanitizeId(body.matchId || rid('match'));
-  const roomId = sanitizeId(body.roomId || '');
-  const expiresAt = 0;
-
-  let rankedAllowed = false;
-  let room = null;
-
-  if (roomId) {
-    const roomRow = await kvGet(`room:${roomId}`);
-    room = payload(roomRow);
-    rankedAllowed = !!roomRow
-      && !!room.ranked
-      && [room.hostPlayerId, room.guestPlayerId].includes(playerId);
-  }
-
-  const requestedRanked = body.ranked === true || body.result?.ranked === true;
-  const ranked = requestedRanked && rankedAllowed;
-
-  const data = {
-    matchId,
-    gameId: sanitizeId(body.gameId || ''),
-    roomId,
-    playerId,
-    ranked,
-    localOnly: !!room?.localOnly,
-    matchMode: ranked ? 'ranked' : 'casual',
-    result: body.result || {},
-    resultHash: safe(body.resultHash || ''),
-    transcriptHash: safe(body.transcriptHash || ''),
-    createdAt: now()
-  };
-
-  await kvPut({ pk: `match:${matchId}:${playerId}`, type: 'match', owner: playerId, expiresAt, data });
-
-  if (!ranked) {
-    return {
-      ok: true,
-      matchId,
-      ranked: false,
-      rated: false,
-      reason: rankedAllowed ? 'casual_match_not_rated' : 'room_not_ranked_or_forbidden'
-    };
-  }
-
-  const pRow = await kvGet(`profile:${playerId}`);
-  const pData = payload(pRow) || {
-    friendId: playerId,
-    displayName: safe(body.displayName || 'Игрок').slice(0, 80),
-    avatarUrl: ''
-  };
-
-  const isWin = body.result?.status === 'win';
-  pData.rating = Math.max(100, (pData.rating || 1000) + (isWin ? 25 : -15));
-  pData.wins = (pData.wins || 0) + (isWin ? 1 : 0);
-  pData.matches = (pData.matches || 0) + 1;
-  pData.updatedAt = now();
-
-  await kvPut({ pk: `profile:${playerId}`, type: 'profile', owner: playerId, data: pData });
-
-  return { ok: true, matchId, ranked: true, rated: true };
-}
-
 async function actionLeaderboardGet(event, body) {
   const rows = await kvPrefix('profile:', 1000);
   const leaders = rows.map(payload)
@@ -3376,9 +3312,7 @@ const ACTIONS = {
   social_session_issue: actionSocialSessionIssue,
   player_register: actionPlayerRegister,
   presence_heartbeat: actionHeartbeat,
-  heartbeat: actionHeartbeat,
   friend_status_check: actionFriendStatus,
-  check_status: actionFriendStatus,
   friend_invite_create: actionFriendInviteCreate,
   friend_invite_get: actionFriendInviteGet,
   friend_invite_accept: actionFriendInviteAccept,
@@ -3386,12 +3320,9 @@ const ACTIONS = {
   room_join: actionRoomJoin,
   room_get: actionRoomGet,
   room_close: actionRoomClose,
-  room_delete: actionRoomClose,
   room_set_mode: actionRoomSetMode,
   signal_send: actionSignalSend,
   signal_poll: actionSignalPoll,
-  send_signal: actionSignalSend,
-  poll_signals: actionSignalPoll,
   game_invite_create: actionGameInviteCreate,
   game_invite_poll: actionGameInvitePoll,
   game_invite_accept: (e, b) => actionGameInviteSet(e, b, 'accepted'),
@@ -3419,7 +3350,7 @@ const ACTIONS = {
   chat_settings_set: actionChatSettingsSet,
   chat_purge_both: actionChatPurgeBoth,
 
-  // ===== FRIENDS MODULE (Phase A) =====
+  // ===== FRIENDS / E2EE V2 =====
   profile_set: actionProfileSet,
   profile_get: actionProfileGet,
   friend_list: actionFriendList,
