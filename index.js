@@ -4163,8 +4163,6 @@ async function actionAchievementRewardStatus(event, body) {
 
 const SHARD_WALLET_VERSION = 1;
 const REGISTRATION_SHARD_REWARD = 100;
-const SHARD_WALLET_VERSION = 1;
-const REGISTRATION_SHARD_REWARD = 100;
 const WALLET_GRANT_HISTORY = 300;
 
 const SHARD_AVATAR_CATALOG = Object.freeze([
