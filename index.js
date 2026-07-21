@@ -1371,11 +1371,23 @@ async function actionSignalAck(event, body) {
 
 async function actionProfileSet(event, body) {
   const { playerId } = await requirePlayer(event, body);
+  const old = payload(
+    await kvGet(`profile:${playerId}`)
+  );
 
   const profile = {
+    ...old,
     friendId: playerId,
-    displayName: safe(body.displayName || 'Слушатель').slice(0, 80),
-    avatarUrl: safe(body.avatarUrl || '').slice(0, 400),
+    displayName: safe(
+      body.displayName ||
+      old.displayName ||
+      'Слушатель'
+    ).slice(0, 80),
+    avatarUrl: safe(
+      body.avatarUrl ||
+      old.avatarUrl ||
+      ''
+    ).slice(0, 400),
     updatedAt: now()
   };
 
