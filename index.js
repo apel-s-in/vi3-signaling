@@ -18,6 +18,13 @@ const CFG = {
   friendInviteTtlMs: num(process.env.FRIEND_INVITE_TTL_MS, 604800000),
   gameInviteTtlMs: num(process.env.GAME_INVITE_TTL_MS, 30000),
   roomTtlMs: num(process.env.ROOM_TTL_MS, 86400000),
+  roomJoinTokenTtlMs: Math.max(
+    30000,
+    Math.min(
+      num(process.env.ROOM_JOIN_TOKEN_TTL_MS, 120000),
+      10 * 60 * 1000
+    )
+  ),
   signalTtlMs: num(process.env.SIGNAL_TTL_MS, 600000),
   nearbyTtlMs: num(process.env.NEARBY_TTL_MS, 300000),
   vapidPublicKey: safe(process.env.VAPID_PUBLIC_KEY || ''),
@@ -818,6 +825,24 @@ async function actionFriendInviteAccept(event, body) {
   return { ok: true, friendPlayerId: inv.fromPlayerId };
 }
 
+function roomJoinTokenKey(token) {
+  const value = safe(token);
+  return value
+    ? `roomJoinToken:${hash(value)}`
+    : '';
+}
+
+async function getRoomJoinToken(token) {
+  const pk = roomJoinTokenKey(token);
+  if (!pk) return { row: null, data: {} };
+
+  const row = await kvGet(pk);
+  return {
+    row,
+    data: payload(row)
+  };
+}
+
 async function actionRoomCreate(event, body) {
   const { playerId } = await requirePlayer(event, body);
   const gameId = sanitizeId(body.gameId || 'game', 80);
@@ -844,6 +869,96 @@ async function actionRoomCreate(event, body) {
   await kvPut({ pk: `room:${roomId}`, type: 'room', owner: playerId, expiresAt, data: room });
 
   return { ok: true, roomId, roomSecret, hostPeerId, guestPeerId, room };
+}
+
+async function actionRoomJoinTokenCreate(event, body) {
+  const { playerId } = await requirePlayer(event, body);
+  const roomId = sanitizeId(body.roomId);
+  const roomSecret = safe(
+    body.roomSecret ||
+    body.secret ||
+    body.key ||
+    ''
+  );
+
+  const roomRow = roomId
+    ? await kvGet(`room:${roomId}`)
+    : null;
+  const room = payload(roomRow);
+
+  if (
+    !roomRow ||
+    room.roomSecretHash !== hash(roomSecret)
+  ) {
+    return {
+      ok: false,
+      reason: 'room_not_found'
+    };
+  }
+
+  if (room.hostPlayerId !== playerId) {
+    return {
+      ok: false,
+      reason: 'room_host_required'
+    };
+  }
+
+  if (
+    room.status === 'closed' ||
+    num(room.closedAt) > 0
+  ) {
+    return {
+      ok: false,
+      reason: 'room_closed'
+    };
+  }
+
+  await enforceRateLimit({
+    scope: 'room_join_token',
+    actor: playerId,
+    limit: 30,
+    windowMs: 10 * 60 * 1000
+  });
+
+  const token = base64url(crypto.randomBytes(24));
+  const createdAt = now();
+  const expiresAt = Math.min(
+    num(room.reconnectUntil) ||
+      createdAt + CFG.roomTtlMs,
+    createdAt + CFG.roomJoinTokenTtlMs
+  );
+  const invitedPlayerId = sanitizeId(
+    body.invitedPlayerId ||
+    body.toFriendId ||
+    ''
+  );
+
+  const data = {
+    roomId,
+    roomSecret,
+    gameId: sanitizeId(room.gameId || 'game', 80),
+    createdByPlayerId: playerId,
+    invitedPlayerId,
+    createdAt,
+    expiresAt,
+    redeemedAt: 0,
+    redeemedByPlayerId: ''
+  };
+
+  await kvPut({
+    pk: roomJoinTokenKey(token),
+    type: 'roomJoinToken',
+    owner: playerId,
+    expiresAt,
+    data
+  });
+
+  return {
+    ok: true,
+    token,
+    gameId: data.gameId,
+    expiresAt
+  };
 }
 
 async function actionRoomJoin(event, body) {
@@ -914,6 +1029,95 @@ async function actionRoomJoin(event, body) {
     localOnly: !!room.localOnly,
     matchMode: safe(room.matchMode || (room.ranked ? 'ranked' : 'casual')),
     room
+  };
+}
+
+async function actionRoomJoinTokenRedeem(event, body) {
+  const { playerId } = await requirePlayer(event, body);
+  const token = safe(
+    body.joinToken ||
+    body.token ||
+    ''
+  );
+
+  if (!token || token.length > 180) {
+    throw new Error('room_join_token_required');
+  }
+
+  const { row, data } = await getRoomJoinToken(token);
+
+  if (!row || !data.roomId || !data.roomSecret) {
+    return {
+      ok: false,
+      reason: 'room_join_token_not_found'
+    };
+  }
+
+  if (
+    num(data.expiresAt) > 0 &&
+    num(data.expiresAt) < now()
+  ) {
+    return {
+      ok: false,
+      reason: 'room_join_token_expired'
+    };
+  }
+
+  if (
+    data.invitedPlayerId &&
+    data.invitedPlayerId !== playerId
+  ) {
+    return {
+      ok: false,
+      reason: 'room_join_token_forbidden'
+    };
+  }
+
+  if (
+    data.redeemedByPlayerId &&
+    data.redeemedByPlayerId !== playerId
+  ) {
+    return {
+      ok: false,
+      reason: 'room_join_token_used'
+    };
+  }
+
+  if (!data.redeemedByPlayerId) {
+    const updated = {
+      ...data,
+      redeemedAt: now(),
+      redeemedByPlayerId: playerId
+    };
+
+    const changed = await kvCompareAndPut({
+      row,
+      type: 'roomJoinToken',
+      owner: data.createdByPlayerId || '',
+      expiresAt: num(data.expiresAt),
+      data: updated
+    });
+
+    if (!changed) {
+      const latest = await getRoomJoinToken(token);
+
+      if (
+        latest.data.redeemedByPlayerId !== playerId
+      ) {
+        return {
+          ok: false,
+          reason: 'room_join_token_used'
+        };
+      }
+    }
+  }
+
+  return {
+    ok: true,
+    roomId: data.roomId,
+    roomSecret: data.roomSecret,
+    gameId: data.gameId,
+    expiresAt: num(data.expiresAt)
   };
 }
 
@@ -1429,9 +1633,27 @@ async function actionPushSend(event, body) {
   const pushId = rid('push');
   const kind = safe(body.kind || 'GENERIC').slice(0, 40);
   const gameId = sanitizeId(body.gameId || '');
-  const roomId = sanitizeId(body.roomId || '');
-  const roomSecret = safe(body.roomSecret || '');
+  const joinToken = safe(body.joinToken || '').slice(0, 180);
   const text = safe(body.text || '').slice(0, 300);
+
+  let gameRoomId = '';
+
+  if (kind === 'GAME_INVITE') {
+    const join = await getRoomJoinToken(joinToken);
+
+    if (
+      !join.row ||
+      join.data.createdByPlayerId !== playerId ||
+      (
+        join.data.invitedPlayerId &&
+        join.data.invitedPlayerId !== toFriendId
+      )
+    ) {
+      throw new Error('game_join_token_invalid');
+    }
+
+    gameRoomId = sanitizeId(join.data.roomId);
+  }
   const createdAt = now();
   const expiresAt = kind === 'GAME_INVITE'
     ? createdAt + Math.max(30000, Math.min(CFG.gameInviteTtlMs || 30000, 120000))
@@ -1447,8 +1669,7 @@ async function actionPushSend(event, body) {
       fromFriendId: playerId,
       kind,
       gameId,
-      roomId,
-      roomSecret,
+      joinToken,
       text,
       createdAt,
       expiresAt
@@ -1466,7 +1687,9 @@ async function actionPushSend(event, body) {
       ? 'Приглашение: Война Сердец'
       : 'Ждёт вас в приложении',
     url: './?openFriends=1',
-    tag: isGameInvite ? `game-${roomId || pushId}` : `push-${pushId}`,
+    tag: isGameInvite
+      ? `game-${gameRoomId || pushId}`
+      : `push-${pushId}`,
     requireInteraction: true,
     kind,
     fromFriendId: playerId,
@@ -3318,6 +3541,8 @@ const ACTIONS = {
   friend_invite_accept: actionFriendInviteAccept,
   room_create: actionRoomCreate,
   room_join: actionRoomJoin,
+  room_join_token_create: actionRoomJoinTokenCreate,
+  room_join_token_redeem: actionRoomJoinTokenRedeem,
   room_get: actionRoomGet,
   room_close: actionRoomClose,
   room_set_mode: actionRoomSetMode,
