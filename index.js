@@ -3269,39 +3269,45 @@ function validateRankedReveal(reveal) {
 
   const shipByCell = new Map();
 
-  ships.forEach((ship, index) => {
+  for (let index = 0; index < ships.length; index++) {
+    const ship = ships[index];
     const xs = new Set(ship.map(point => point.x));
     const ys = new Set(ship.map(point => point.y));
 
     if (xs.size > 1 && ys.size > 1) {
-      shipByCell.clear();
-      return;
+      return {
+        ok: false,
+        reason: 'ranked_bent_ship'
+      };
     }
 
     const sorted = ship.slice().sort((a, b) =>
-      xs.size === 1 ? a.y - b.y : a.x - b.x
+      xs.size === 1
+        ? a.y - b.y
+        : a.x - b.x
     );
 
     for (let i = 1; i < sorted.length; i++) {
       const previous = sorted[i - 1];
       const current = sorted[i];
+
       const continuous = xs.size === 1
-        ? current.x === previous.x && current.y === previous.y + 1
-        : current.y === previous.y && current.x === previous.x + 1;
+        ? current.x === previous.x &&
+          current.y === previous.y + 1
+        : current.y === previous.y &&
+          current.x === previous.x + 1;
 
       if (!continuous) {
-        shipByCell.clear();
-        return;
+        return {
+          ok: false,
+          reason: 'ranked_ship_has_gap'
+        };
       }
     }
 
     ship.forEach(point => {
       shipByCell.set(rankedPointKey(point), index);
     });
-  });
-
-  if (!shipByCell.size) {
-    return { ok: false, reason: 'ranked_bent_or_gapped_ship' };
   }
 
   for (const [key, shipIndex] of shipByCell) {
@@ -3611,15 +3617,24 @@ async function applyRankedProfileSettlement({
       ? profile.rankedSettlements.map(value => sanitizeId(value, 120))
       : [];
 
-    if (settled.includes(matchId)) {
-      return { ok: true, duplicate: true };
-    }
+    const currentRating = Math.max(
+      100,
+      num(profile.rating, 1000)
+    );
 
-    const currentRating = Math.max(100, num(profile.rating, 1000));
     const matches = Math.max(
       num(profile.rankedMatches),
       num(profile.matches)
     );
+
+    if (settled.includes(matchId)) {
+      return {
+        ok: true,
+        duplicate: true,
+        rating: currentRating,
+        matches
+      };
+    }
 
     const next = {
       ...profile,
@@ -3842,54 +3857,88 @@ async function actionRankedMatchPrepare(event, body) {
     return { ok: false, reason: 'ranked_two_players_required' };
   }
 
-  let matchId = sanitizeId(room.rankedMatchId, 120);
+  let matchId = '';
 
-  if (!matchId) {
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const currentRoomRow = attempt === 0
+      ? roomRow
+      : await kvGet(`room:${roomId}`);
+
+    if (!currentRoomRow) {
+      throw new Error('room_not_found');
+    }
+
+    const currentRoom = payload(currentRoomRow);
+    const currentMatchId = sanitizeId(
+      currentRoom.rankedMatchId,
+      120
+    );
+
+    const currentMatchRow = currentMatchId
+      ? await kvGet(rankedMatchKey(currentMatchId))
+      : null;
+
+    const currentMatch = payload(currentMatchRow);
+    const terminal = ['settled', 'disputed']
+      .includes(currentMatch.status);
+
+    if (
+      currentMatchRow &&
+      !terminal
+    ) {
+      matchId = currentMatchId;
+      break;
+    }
+
     const candidate = rid('ranked');
-    const updatedRoom = {
-      ...room,
-      rankedMatchId: candidate,
-      rankedPreparedAt: now(),
-      updatedAt: now()
-    };
+    const preparedAt = now();
 
     const changed = await kvCompareAndPut({
-      row: roomRow,
+      row: currentRoomRow,
       type: 'room',
-      owner: room.hostPlayerId,
-      expiresAt: num(roomRow.expires_at),
-      data: updatedRoom
+      owner: currentRoom.hostPlayerId,
+      expiresAt: num(currentRoomRow.expires_at),
+      data: {
+        ...currentRoom,
+        rankedMatchId: candidate,
+        rankedPreparedAt: preparedAt,
+        updatedAt: preparedAt
+      }
     });
 
-    if (changed) {
-      matchId = candidate;
+    if (!changed) continue;
 
-      await kvPut({
-        pk: rankedMatchKey(matchId),
-        type: 'rankedMatch',
-        owner: roomId,
-        expiresAt: num(room.reconnectUntil) || now() + CFG.roomTtlMs,
-        data: {
-          version: 2,
-          matchId,
-          roomId,
-          gameId: RANKED_GAME_ID,
-          participants,
-          status: 'pending',
-          submissions: {},
-          createdAt: now(),
-          updatedAt: now()
-        }
-      });
-    } else {
-      const latestRoom = payload(await kvGet(`room:${roomId}`));
-      matchId = sanitizeId(latestRoom.rankedMatchId, 120);
-    }
+    await kvPut({
+      pk: rankedMatchKey(candidate),
+      type: 'rankedMatch',
+      owner: roomId,
+      expiresAt:
+        num(currentRoom.reconnectUntil) ||
+        preparedAt + CFG.roomTtlMs,
+      data: {
+        version: 2,
+        matchId: candidate,
+        roomId,
+        gameId: RANKED_GAME_ID,
+        participants,
+        status: 'pending',
+        submissions: {},
+        createdAt: preparedAt,
+        updatedAt: preparedAt
+      }
+    });
+
+    matchId = candidate;
+    break;
   }
 
-  const matchRow = matchId
-    ? await kvGet(rankedMatchKey(matchId))
-    : null;
+  if (!matchId) {
+    throw new Error('ranked_match_prepare_conflict');
+  }
+
+  const matchRow = await kvGet(
+    rankedMatchKey(matchId)
+  );
   const match = payload(matchRow);
 
   if (!matchRow) {
@@ -4425,7 +4474,7 @@ exports.handler = async event => {
       ) {
         status = 403;
       } else if (
-        /chat_revision_conflict|crypto_.*(?:missing|not_ready|conflict)|chat_e2ee_disabled/i.test(msg)
+        /chat_revision_conflict|ranked_.*conflict|crypto_.*(?:missing|not_ready|conflict)|chat_e2ee_disabled/i.test(msg)
       ) {
         status = 409;
       } else if (
