@@ -704,6 +704,17 @@ async function actionSocialSessionIssue(event, body) {
     }
   });
 
+  const registrationGrant =
+    await ensureRegistrationShardGrant(
+      identity.friendId
+    ).catch(error => ({
+      ok: false,
+      duplicate: false,
+      amount: 0,
+      operationId: '',
+      error: safe(error?.message)
+    }));
+
   const session = issueSocialSession({
     sub: identity.friendId,
     yidHash: hash(`ya:${identity.yandexId}`),
@@ -718,6 +729,18 @@ async function actionSocialSessionIssue(event, body) {
     friendId: identity.friendId,
     socialSession: session,
     expiresAt,
+    registrationGrant: {
+      ok: registrationGrant.ok === true,
+      amount: num(registrationGrant.amount),
+      duplicate: registrationGrant.duplicate === true,
+      operationId: safe(
+        registrationGrant.operationId
+      ),
+      error: safe(registrationGrant.error)
+    },
+    wallet: registrationGrant.wallet
+      ? publicShardWallet(registrationGrant.wallet)
+      : null,
     profile: {
       friendId: identity.friendId,
       displayName: identity.displayName,
@@ -3210,6 +3233,9 @@ async function actionVoiceCallEnd(event, body) {
 }
 
 const SHARD_WALLET_VERSION = 1;
+const REGISTRATION_SHARD_REWARD = 100;
+const WALLET_GRANT_HISTORY = 300;
+
 const SHARD_AVATAR_CATALOG = Object.freeze([
   Object.freeze({
     id: 'avatar_dragon',
@@ -3341,7 +3367,7 @@ function publicShardWallet(wallet) {
 
 async function getOrCreateShardWallet(playerId) {
   const key = walletKey(playerId);
-  const row = await kvGet(key);
+  let row = await kvGet(key);
 
   if (row) {
     return {
@@ -3355,27 +3381,171 @@ async function getOrCreateShardWallet(playerId) {
 
   const wallet = normalizeShardWallet({}, playerId);
 
-  await kvPut({
-    pk: key,
-    type: 'wallet',
-    owner: playerId,
-    data: wallet
-  });
+  try {
+    await kvInsert({
+      pk: key,
+      type: 'wallet',
+      owner: playerId,
+      data: wallet
+    });
+  } catch {
+    // Параллельный запрос мог создать wallet первым.
+  }
+
+  row = await kvGet(key);
+  if (!row) throw new Error('wallet_create_failed');
 
   return {
-    row: await kvGet(key),
-    wallet
+    row,
+    wallet: normalizeShardWallet(
+      payload(row),
+      playerId
+    )
   };
+}
+async function ensureRegistrationShardGrant(playerId) {
+  const operationId = [
+    'grant',
+    'registration',
+    sanitizeId(playerId, 96)
+  ].join(':');
+
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const { row, wallet } =
+      await getOrCreateShardWallet(playerId);
+
+    if (wallet.operations?.[operationId]) {
+      return {
+        ok: true,
+        duplicate: true,
+        operationId,
+        amount: REGISTRATION_SHARD_REWARD,
+        wallet
+      };
+    }
+
+    const at = now();
+    const next = {
+      ...wallet,
+      balance:
+        wallet.balance +
+        REGISTRATION_SHARD_REWARD,
+      earned:
+        wallet.earned +
+        REGISTRATION_SHARD_REWARD,
+      operations: trimWalletOperations({
+        ...(wallet.operations || {}),
+        [operationId]: {
+          kind: 'grant',
+          matchId: 'registration',
+          amount: REGISTRATION_SHARD_REWARD,
+          at
+        }
+      }),
+      updatedAt: at
+    };
+
+    const changed = await kvCompareAndPut({
+      row,
+      type: 'wallet',
+      owner: playerId,
+      data: next
+    });
+
+    if (!changed) continue;
+
+    return {
+      ok: true,
+      duplicate: false,
+      operationId,
+      amount: REGISTRATION_SHARD_REWARD,
+      wallet: next
+    };
+  }
+
+  throw new Error('wallet_registration_grant_conflict');
 }
 
 async function actionWalletGet(event, body) {
   const { playerId } = await requirePlayer(event, body);
-  const { wallet } = await getOrCreateShardWallet(playerId);
+  const grant = await ensureRegistrationShardGrant(
+    playerId
+  );
 
   return {
     ok: true,
-    wallet: publicShardWallet(wallet),
+    registrationGrant: {
+      amount: grant.amount,
+      duplicate: grant.duplicate,
+      operationId: grant.operationId
+    },
+    wallet: publicShardWallet(grant.wallet),
     catalog: SHARD_AVATAR_CATALOG
+  };
+}
+async function actionWalletRegistrationBackfill(
+  event,
+  body
+) {
+  const admin =
+    headerValue(event, 'x-vi3-admin') ||
+    safe(body.adminSecret);
+
+  if (
+    !CFG.adminSecret ||
+    !timingSafeEqualText(admin, CFG.adminSecret)
+  ) {
+    throw new Error('bad_admin_secret');
+  }
+
+  const limit = Math.max(
+    1,
+    Math.min(1000, Math.floor(num(body.limit, 1000)))
+  );
+  const rows = await kvPrefix('player:', limit);
+  const results = [];
+
+  for (const row of rows) {
+    const playerId = sanitizeId(
+      payload(row)?.playerId ||
+      row.owner,
+      96
+    );
+
+    if (!playerId) continue;
+
+    try {
+      const grant =
+        await ensureRegistrationShardGrant(playerId);
+
+      results.push({
+        playerId,
+        ok: true,
+        duplicate: grant.duplicate,
+        amount: grant.amount
+      });
+    } catch (error) {
+      results.push({
+        playerId,
+        ok: false,
+        error: safe(error?.message)
+      });
+    }
+  }
+
+  return {
+    ok: true,
+    scanned: rows.length,
+    granted: results.filter(
+      item => item.ok && !item.duplicate
+    ).length,
+    duplicates: results.filter(
+      item => item.ok && item.duplicate
+    ).length,
+    failed: results.filter(
+      item => !item.ok
+    ).length,
+    results
   };
 }
 
@@ -6405,6 +6575,8 @@ const ACTIONS = {
   ranked_match_cleanup: actionRankedMatchCleanup,
   leaderboard_v2_get: actionLeaderboardV2Get,
   wallet_get: actionWalletGet,
+  wallet_registration_backfill:
+    actionWalletRegistrationBackfill,
   wallet_purchase_avatar: actionWalletPurchaseAvatar,
   rtc_config: actionRtcConfig,
   webpush_config: actionWebPushConfig,
