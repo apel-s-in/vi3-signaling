@@ -292,16 +292,37 @@ function valueOf(x) {
 }
 
 function rowsOf(res) {
-  const rs = res?.resultSets?.[0] || res?.resultSet || null;
+  const sets = Array.isArray(res?.resultSets)
+    ? res.resultSets
+    : res?.resultSet
+      ? [res.resultSet]
+      : [];
+
+  const rs =
+    sets.find(set =>
+      Array.isArray(set?.rows) &&
+      set.rows.length > 0
+    ) ||
+    sets.find(set =>
+      Array.isArray(set?.columns) &&
+      set.columns.length > 0
+    ) ||
+    null;
+
   const rows = rs?.rows || [];
-  const cols = (rs?.columns || []).map(c => safe(c.name || c));
-  return rows.map(r => {
-    const items = r.items || r;
-    if (!Array.isArray(items)) return r;
+  const cols = (rs?.columns || [])
+    .map(column => safe(column.name || column));
+
+  return rows.map(row => {
+    const items = row.items || row;
+    if (!Array.isArray(items)) return row;
+
     const out = {};
-    items.forEach((it, i) => {
-      out[cols[i] || `c${i}`] = valueOf(it);
+
+    items.forEach((item, index) => {
+      out[cols[index] || `c${index}`] = valueOf(item);
     });
+
     return out;
   });
 }
@@ -506,9 +527,19 @@ async function kvCompareAndPut({
 
   const changed = rowsOf(result)[0] || null;
 
-  return !!changed &&
-    changed.pk === row.pk &&
-    num(changed.updated_at) === nextUpdatedAt;
+  if (
+    changed?.pk === row.pk &&
+    num(changed.updated_at) === nextUpdatedAt
+  ) {
+    return true;
+  }
+
+  const verified = await kvGet(row.pk);
+
+  return !!verified &&
+    num(verified.updated_at) === nextUpdatedAt &&
+    stableStringify(payload(verified)) ===
+      stableStringify(data || {});
 }
 
 async function kvDelete(pk) {
@@ -3300,6 +3331,23 @@ function normalizeShardWallet(raw, playerId) {
       .slice(-300)
   );
 
+  const grantIds = [...new Set([
+    ...(
+      Array.isArray(wallet.grantIds)
+        ? wallet.grantIds
+        : []
+    ),
+    ...Object.entries(operations)
+      .filter(([, operation]) =>
+        operation?.kind === 'grant' ||
+        operation?.kind === 'achievement_grant'
+      )
+      .map(([operationId]) => operationId)
+  ]
+    .map(operationId => sanitizeId(operationId, 180))
+    .filter(Boolean)
+  )];
+
   const lockedByRecords = Object.values(locks)
     .reduce((sum, amount) => sum + amount, 0);
 
@@ -3313,6 +3361,7 @@ function normalizeShardWallet(raw, playerId) {
     ),
     locks,
     operations,
+    grantIds,
     earned: Math.max(0, Math.floor(num(wallet.earned))),
     spent: Math.max(0, Math.floor(num(wallet.spent))),
     purchasedAvatarIds: [...new Set(
@@ -3414,7 +3463,10 @@ async function ensureRegistrationShardGrant(playerId) {
     const { row, wallet } =
       await getOrCreateShardWallet(playerId);
 
-    if (wallet.operations?.[operationId]) {
+    if (
+      wallet.grantIds?.includes(operationId) ||
+      wallet.operations?.[operationId]
+    ) {
       return {
         ok: true,
         duplicate: true,
@@ -3433,6 +3485,10 @@ async function ensureRegistrationShardGrant(playerId) {
       earned:
         wallet.earned +
         REGISTRATION_SHARD_REWARD,
+      grantIds: [...new Set([
+        ...(wallet.grantIds || []),
+        operationId
+      ])],
       operations: trimWalletOperations({
         ...(wallet.operations || {}),
         [operationId]: {
