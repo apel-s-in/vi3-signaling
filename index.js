@@ -5434,10 +5434,25 @@ async function buildRankedSettlementPlan({
     loserDelta: -winnerDelta,
     turns: Math.max(0, num(turns)),
     economy: {
-      required: false,
-      status: 'not_required',
-      stakeEach: 0,
-      escrow: 0
+      required: match.economy?.required === true,
+      status: safe(
+        match.economy?.status ||
+        'locking'
+      ),
+      stakeEach: Math.max(
+        0,
+        Math.floor(num(
+          match.economy?.stakeEach,
+          RANKED_STAKE_AMOUNT
+        ))
+      ),
+      escrow: Math.max(
+        0,
+        Math.floor(num(
+          match.economy?.escrow,
+          RANKED_STAKE_AMOUNT * 2
+        ))
+      )
     },
     createdAt: now()
   };
@@ -5541,11 +5556,7 @@ async function settleRankedMatch(matchId) {
           {
             reason: check.reason,
             extra: {
-              validation: check,
-              economy: {
-                required: false,
-                status: 'not_required'
-              }
+              validation: check
             }
           }
         );
@@ -5788,10 +5799,6 @@ async function reconcileRankedMatch(matchId) {
               validation: {
                 ok: false,
                 reason: 'ranked_peer_submission_timeout'
-              },
-              economy: {
-                required: false,
-                status: 'not_required'
               }
             }
           }
@@ -5819,13 +5826,7 @@ async function reconcileRankedMatch(matchId) {
         match,
         'aborted',
         {
-          reason: 'ranked_abandoned',
-          extra: {
-            economy: {
-              required: false,
-              status: 'not_required'
-            }
-          }
+          reason: 'ranked_abandoned'
         }
       );
 
