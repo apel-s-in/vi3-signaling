@@ -3380,6 +3380,12 @@ const RANKED_SETTLEMENT_HISTORY = 100;
 const RANKED_FORFEIT_GRACE_MS = 2 * 60 * 1000;
 const RANKED_SUBMISSION_TIMEOUT_MS = 5 * 60 * 1000;
 const RANKED_ABANDONED_TIMEOUT_MS = 6 * 60 * 60 * 1000;
+const RANKED_RPS_MAX_ROUNDS = 20;
+const RANKED_RPS_CHOICES = new Set([
+  'rock',
+  'scissors',
+  'paper'
+]);
 
 const RANKED_TERMINAL_STATUSES = new Set([
   'settled',
@@ -3445,6 +3451,556 @@ function transitionRankedMatch(match, nextStatus, {
       ? { terminalAt: at }
       : {})
   };
+}
+
+function rankedRpsCommitHash({
+  matchId,
+  round,
+  playerId,
+  choice,
+  salt
+}) {
+  return hash([
+    sanitizeId(matchId, 120),
+    Math.max(1, Math.floor(num(round, 1))),
+    sanitizeId(playerId, 96),
+    sanitizeId(choice, 20),
+    safe(salt).slice(0, 160)
+  ].join(':'));
+}
+
+function compareRankedRps(left, right) {
+  if (left === right) return 'draw';
+
+  if (
+    (left === 'rock' && right === 'scissors') ||
+    (left === 'scissors' && right === 'paper') ||
+    (left === 'paper' && right === 'rock')
+  ) {
+    return 'left';
+  }
+
+  return 'right';
+}
+
+function normalizeRankedRps(raw = {}) {
+  const currentRound = Math.max(
+    1,
+    Math.min(
+      RANKED_RPS_MAX_ROUNDS,
+      Math.floor(num(raw.currentRound, 1))
+    )
+  );
+
+  const rounds = {};
+
+  Object.entries(
+    raw.rounds && typeof raw.rounds === 'object'
+      ? raw.rounds
+      : {}
+  ).forEach(([key, value]) => {
+    const round = Math.floor(num(key));
+    if (
+      round < 1 ||
+      round > RANKED_RPS_MAX_ROUNDS ||
+      !value ||
+      typeof value !== 'object'
+    ) return;
+
+    rounds[round] = {
+      round,
+      status: sanitizeId(value.status || 'committing', 30),
+      commits:
+        value.commits && typeof value.commits === 'object'
+          ? value.commits
+          : {},
+      reveals:
+        value.reveals && typeof value.reveals === 'object'
+          ? value.reveals
+          : {},
+      winnerId: sanitizeId(value.winnerId, 96),
+      loserId: sanitizeId(value.loserId, 96),
+      createdAt: num(value.createdAt),
+      resolvedAt: num(value.resolvedAt)
+    };
+  });
+
+  return {
+    version: 1,
+    status: sanitizeId(raw.status || 'waiting', 30),
+    currentRound,
+    firstPlayerId: sanitizeId(raw.firstPlayerId, 96),
+    rounds,
+    updatedAt: num(raw.updatedAt)
+  };
+}
+
+function publicRankedRps(match, playerId) {
+  const rps = normalizeRankedRps(match?.rps || {});
+  const round = rps.rounds[rps.currentRound] || {
+    round: rps.currentRound,
+    status: 'committing',
+    commits: {},
+    reveals: {}
+  };
+
+  const commits = Object.keys(round.commits || {});
+  const reveals = Object.keys(round.reveals || {});
+  const resolved = ['resolved', 'draw'].includes(round.status);
+
+  return {
+    version: rps.version,
+    status: rps.status,
+    round: rps.currentRound,
+    roundStatus: round.status,
+    committed: commits.includes(playerId),
+    commits: commits.length,
+    revealed: reveals.includes(playerId),
+    reveals: reveals.length,
+    canReveal:
+      commits.length === 2 &&
+      !reveals.includes(playerId) &&
+      !resolved,
+    winnerId: resolved ? round.winnerId : '',
+    loserId: resolved ? round.loserId : '',
+    firstPlayerId: rps.firstPlayerId,
+    choices: resolved
+      ? Object.fromEntries(
+          Object.entries(round.reveals || {})
+            .map(([id, reveal]) => [
+              id,
+              sanitizeId(reveal?.choice, 20)
+            ])
+        )
+      : {},
+    updatedAt: rps.updatedAt
+  };
+}
+
+function rankedRpsError(message, status = 409) {
+  const error = new Error(message);
+  error.httpStatus = status;
+  return error;
+}
+
+async function requireRankedMatchPlayer(
+  event,
+  body
+) {
+  const { playerId } = await requirePlayer(event, body);
+  const matchId = sanitizeId(body.matchId, 120);
+
+  if (!matchId) {
+    throw new Error('ranked_match_required');
+  }
+
+  const row = await kvGet(rankedMatchKey(matchId));
+  if (!row) throw new Error('ranked_match_not_found');
+
+  const match = payload(row);
+
+  if (!match.participants?.includes(playerId)) {
+    throw new Error('ranked_match_forbidden');
+  }
+
+  return {
+    playerId,
+    matchId,
+    row,
+    match
+  };
+}
+
+async function actionRankedRpsCommit(event, body) {
+  const auth = await requireRankedMatchPlayer(
+    event,
+    body
+  );
+
+  const requestedRound = Math.max(
+    1,
+    Math.floor(num(body.round, 1))
+  );
+  const commit = safe(body.commit).toLowerCase();
+
+  if (!/^[a-f0-9]{64}$/.test(commit)) {
+    throw new Error('bad_ranked_rps_commit');
+  }
+
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const row = attempt === 0
+      ? auth.row
+      : await kvGet(rankedMatchKey(auth.matchId));
+
+    if (!row) throw new Error('ranked_match_not_found');
+
+    const match = payload(row);
+
+    if (!match.participants?.includes(auth.playerId)) {
+      throw new Error('ranked_match_forbidden');
+    }
+
+    if (isRankedTerminal(match.status)) {
+      return {
+        ok: true,
+        duplicate: true,
+        match: publicRankedMatch(
+          match,
+          auth.playerId
+        )
+      };
+    }
+
+    if (match.status !== 'pending') {
+      throw rankedRpsError(
+        'ranked_rps_match_not_pending'
+      );
+    }
+
+    const rps = normalizeRankedRps(match.rps);
+
+    if (rps.firstPlayerId) {
+      return {
+        ok: true,
+        duplicate: true,
+        match: publicRankedMatch(
+          match,
+          auth.playerId
+        )
+      };
+    }
+
+    if (requestedRound !== rps.currentRound) {
+      throw rankedRpsError(
+        'ranked_rps_round_mismatch'
+      );
+    }
+
+    const current = rps.rounds[requestedRound] || {
+      round: requestedRound,
+      status: 'committing',
+      commits: {},
+      reveals: {},
+      winnerId: '',
+      loserId: '',
+      createdAt: now(),
+      resolvedAt: 0
+    };
+
+    const oldCommit = safe(
+      current.commits?.[auth.playerId]
+    );
+
+    if (oldCommit) {
+      if (oldCommit !== commit) {
+        throw rankedRpsError(
+          'ranked_rps_commit_conflict'
+        );
+      }
+
+      return {
+        ok: true,
+        duplicate: true,
+        match: publicRankedMatch(
+          match,
+          auth.playerId
+        )
+      };
+    }
+
+    const commits = {
+      ...(current.commits || {}),
+      [auth.playerId]: commit
+    };
+
+    const nextRound = {
+      ...current,
+      status:
+        Object.keys(commits).length === 2
+          ? 'revealing'
+          : 'committing',
+      commits
+    };
+
+    const nextRps = {
+      ...rps,
+      status:
+        Object.keys(commits).length === 2
+          ? 'revealing'
+          : 'committing',
+      rounds: {
+        ...rps.rounds,
+        [requestedRound]: nextRound
+      },
+      updatedAt: now()
+    };
+
+    const next = {
+      ...match,
+      rps: nextRps,
+      updatedAt: now()
+    };
+
+    if (!await kvCompareAndPut({
+      row,
+      type: 'rankedMatch',
+      owner: match.roomId,
+      expiresAt: num(row.expires_at),
+      data: next
+    })) {
+      continue;
+    }
+
+    return {
+      ok: true,
+      duplicate: false,
+      match: publicRankedMatch(
+        next,
+        auth.playerId
+      )
+    };
+  }
+
+  throw rankedRpsError(
+    'ranked_rps_commit_conflict'
+  );
+}
+
+async function actionRankedRpsReveal(event, body) {
+  const auth = await requireRankedMatchPlayer(
+    event,
+    body
+  );
+
+  const requestedRound = Math.max(
+    1,
+    Math.floor(num(body.round, 1))
+  );
+  const choice = sanitizeId(body.choice, 20);
+  const salt = safe(body.salt).slice(0, 160);
+
+  if (
+    !RANKED_RPS_CHOICES.has(choice) ||
+    !salt ||
+    salt.length < 16
+  ) {
+    throw new Error('bad_ranked_rps_reveal');
+  }
+
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const row = attempt === 0
+      ? auth.row
+      : await kvGet(rankedMatchKey(auth.matchId));
+
+    if (!row) throw new Error('ranked_match_not_found');
+
+    const match = payload(row);
+
+    if (!match.participants?.includes(auth.playerId)) {
+      throw new Error('ranked_match_forbidden');
+    }
+
+    if (isRankedTerminal(match.status)) {
+      return {
+        ok: true,
+        duplicate: true,
+        match: publicRankedMatch(
+          match,
+          auth.playerId
+        )
+      };
+    }
+
+    if (match.status !== 'pending') {
+      throw rankedRpsError(
+        'ranked_rps_match_not_pending'
+      );
+    }
+
+    const rps = normalizeRankedRps(match.rps);
+
+    if (rps.firstPlayerId) {
+      return {
+        ok: true,
+        duplicate: true,
+        match: publicRankedMatch(
+          match,
+          auth.playerId
+        )
+      };
+    }
+
+    if (requestedRound !== rps.currentRound) {
+      throw rankedRpsError(
+        'ranked_rps_round_mismatch'
+      );
+    }
+
+    const current = rps.rounds[requestedRound];
+
+    if (
+      !current ||
+      Object.keys(current.commits || {}).length !== 2
+    ) {
+      throw rankedRpsError(
+        'ranked_rps_reveal_not_ready'
+      );
+    }
+
+    const expectedCommit = rankedRpsCommitHash({
+      matchId: auth.matchId,
+      round: requestedRound,
+      playerId: auth.playerId,
+      choice,
+      salt
+    });
+
+    if (
+      safe(current.commits?.[auth.playerId]) !==
+      expectedCommit
+    ) {
+      throw rankedRpsError(
+        'ranked_rps_reveal_mismatch'
+      );
+    }
+
+    const oldReveal = current.reveals?.[auth.playerId];
+
+    if (oldReveal) {
+      if (
+        oldReveal.choice !== choice ||
+        oldReveal.salt !== salt
+      ) {
+        throw rankedRpsError(
+          'ranked_rps_reveal_conflict'
+        );
+      }
+
+      return {
+        ok: true,
+        duplicate: true,
+        match: publicRankedMatch(
+          match,
+          auth.playerId
+        )
+      };
+    }
+
+    const reveals = {
+      ...(current.reveals || {}),
+      [auth.playerId]: {
+        choice,
+        salt,
+        revealedAt: now()
+      }
+    };
+
+    let nextRound = {
+      ...current,
+      status: 'revealing',
+      reveals
+    };
+
+    let nextRps = {
+      ...rps,
+      status: 'revealing',
+      rounds: {
+        ...rps.rounds,
+        [requestedRound]: nextRound
+      },
+      updatedAt: now()
+    };
+
+    if (Object.keys(reveals).length === 2) {
+      const [leftId, rightId] = match.participants;
+      const result = compareRankedRps(
+        reveals[leftId].choice,
+        reveals[rightId].choice
+      );
+
+      if (result === 'draw') {
+        if (requestedRound >= RANKED_RPS_MAX_ROUNDS) {
+          throw rankedRpsError(
+            'ranked_rps_round_limit'
+          );
+        }
+
+        nextRound = {
+          ...nextRound,
+          status: 'draw',
+          resolvedAt: now()
+        };
+
+        nextRps = {
+          ...nextRps,
+          status: 'committing',
+          currentRound: requestedRound + 1,
+          rounds: {
+            ...nextRps.rounds,
+            [requestedRound]: nextRound
+          },
+          updatedAt: now()
+        };
+      } else {
+        const winnerId =
+          result === 'left'
+            ? leftId
+            : rightId;
+        const loserId = otherRankedPlayer(
+          match.participants,
+          winnerId
+        );
+
+        nextRound = {
+          ...nextRound,
+          status: 'resolved',
+          winnerId,
+          loserId,
+          resolvedAt: now()
+        };
+
+        nextRps = {
+          ...nextRps,
+          status: 'resolved',
+          firstPlayerId: winnerId,
+          rounds: {
+            ...nextRps.rounds,
+            [requestedRound]: nextRound
+          },
+          updatedAt: now()
+        };
+      }
+    }
+
+    const next = {
+      ...match,
+      rps: nextRps,
+      updatedAt: now()
+    };
+
+    if (!await kvCompareAndPut({
+      row,
+      type: 'rankedMatch',
+      owner: match.roomId,
+      expiresAt: num(row.expires_at),
+      data: next
+    })) {
+      continue;
+    }
+
+    return {
+      ok: true,
+      duplicate: false,
+      match: publicRankedMatch(
+        next,
+        auth.playerId
+      )
+    };
+  }
+
+  throw rankedRpsError(
+    'ranked_rps_reveal_conflict'
+  );
 }
 
 function rankedMatchKey(matchId) {
@@ -3842,8 +4398,15 @@ function validateRankedSubmissions(match) {
     return { ok: false, reason: 'ranked_submissions_pending' };
   }
 
+  const serverFirstPlayerId = sanitizeId(
+    match.rps?.firstPlayerId,
+    96
+  );
+
   if (
-    left.firstPlayerId !== right.firstPlayerId ||
+    !serverFirstPlayerId ||
+    left.firstPlayerId !== serverFirstPlayerId ||
+    right.firstPlayerId !== serverFirstPlayerId ||
     left.transcriptHash !== right.transcriptHash ||
     stableStringify(left.transcript) !== stableStringify(right.transcript)
   ) {
@@ -4368,6 +4931,7 @@ function publicRankedMatch(match, playerId) {
     submissions: Object.keys(match.submissions || {}).length,
     validation: match.validation || null,
     settlement: match.settlement || null,
+    rps: publicRankedRps(match, playerId),
     forfeit: match.forfeit
       ? {
           loserId: match.forfeit.loserId,
@@ -4486,6 +5050,14 @@ async function actionRankedMatchPrepare(event, body) {
         gameId: RANKED_GAME_ID,
         participants,
         status: 'pending',
+        rps: {
+          version: 1,
+          status: 'waiting',
+          currentRound: 1,
+          firstPlayerId: '',
+          rounds: {},
+          updatedAt: preparedAt
+        },
         submissions: {},
         createdAt: preparedAt,
         updatedAt: preparedAt
@@ -4540,6 +5112,18 @@ async function actionRankedMatchSubmit(event, body) {
         duplicate: true,
         match: publicRankedMatch(match, playerId)
       };
+    }
+
+    if (match.status !== 'pending') {
+      throw rankedRpsError(
+        'ranked_submission_match_not_pending'
+      );
+    }
+
+    if (!sanitizeId(match.rps?.firstPlayerId, 96)) {
+      throw rankedRpsError(
+        'ranked_rps_not_resolved'
+      );
     }
 
     const submission = normalizeRankedSubmission(
@@ -5081,6 +5665,8 @@ const ACTIONS = {
   signal_send: actionSignalSend,
   signal_poll: actionSignalPoll,
   ranked_match_prepare: actionRankedMatchPrepare,
+  ranked_rps_commit: actionRankedRpsCommit,
+  ranked_rps_reveal: actionRankedRpsReveal,
   ranked_match_submit: actionRankedMatchSubmit,
   ranked_match_status: actionRankedMatchStatus,
   ranked_match_abort: actionRankedMatchAbort,
