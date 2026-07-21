@@ -76,6 +76,27 @@ function hash(v) {
   return crypto.createHash('sha256').update(String(v || ''), 'utf8').digest('hex');
 }
 
+function sortObject(value) {
+  if (Array.isArray(value)) {
+    return value.map(sortObject);
+  }
+
+  if (!value || typeof value !== 'object') {
+    return value;
+  }
+
+  return Object.keys(value)
+    .sort()
+    .reduce((out, key) => {
+      out[key] = sortObject(value[key]);
+      return out;
+    }, {});
+}
+
+function stableStringify(value) {
+  return JSON.stringify(sortObject(value));
+}
+
 function base64url(value) {
   return Buffer.from(value)
     .toString('base64')
@@ -1344,112 +1365,6 @@ async function actionSignalAck(event, body) {
   );
 
   return { ok: true, acked: seqs.length };
-}
-async function actionGameInviteCreate(event, body) {
-  const {
-    playerId,
-    friendId: toPlayerId
-  } = await requireFriendContext(event, body, {
-    friendFields: ['toPlayerId', 'friendId']
-  });
-  const gameId = sanitizeId(body.gameId || 'game', 80);
-
-  const gameInviteId = rid('gi');
-  const expiresAt = now() + CFG.gameInviteTtlMs;
-
-  const invite = {
-    gameInviteId,
-    gameId,
-    fromPlayerId: playerId,
-    toPlayerId,
-    status: 'pending',
-    createdAt: now(),
-    updatedAt: now(),
-    expiresAt
-  };
-
-  await Promise.all([
-    kvPut({
-      pk: `gameInvite:${gameInviteId}`,
-      type: 'gameInvite',
-      owner: toPlayerId,
-      expiresAt,
-      data: invite
-    }),
-    kvPut({
-      pk: `gameInviteInbox:${toPlayerId}:${gameInviteId}`,
-      type: 'gameInviteInbox',
-      owner: toPlayerId,
-      expiresAt,
-      data: invite
-    }),
-    kvPut({
-      pk: `gameInviteOutbox:${playerId}:${gameInviteId}`,
-      type: 'gameInviteOutbox',
-      owner: playerId,
-      expiresAt,
-      data: invite
-    })
-  ]);
-
-  return { ok: true, gameInviteId, expiresAt };
-}
-
-async function actionGameInvitePoll(event, body) {
-  const { playerId } = await requirePlayer(event, body);
-  const [inbox, outbox] = await Promise.all([
-    kvPrefix(`gameInviteInbox:${playerId}:`, 100),
-    kvPrefix(`gameInviteOutbox:${playerId}:`, 100)
-  ]);
-
-  const items = [...new Map(
-    [...inbox, ...outbox]
-      .map(payload)
-      .filter(item => item?.gameInviteId)
-      .map(item => [item.gameInviteId, item])
-  ).values()].sort((a, b) => num(a.createdAt) - num(b.createdAt));
-
-  return { ok: true, items };
-}
-
-async function actionGameInviteSet(event, body, status) {
-  const { playerId } = await requirePlayer(event, body);
-  const gameInviteId = sanitizeId(body.gameInviteId || body.inviteId);
-  const row = gameInviteId ? await kvGet(`gameInvite:${gameInviteId}`) : null;
-  const inv = payload(row);
-  if (!row) return { ok: false, reason: 'invite_not_found' };
-  if (![inv.toPlayerId, inv.fromPlayerId].includes(playerId)) throw new Error('invite_forbidden');
-
-  inv.status = status;
-  inv.updatedAt = now();
-  if (status === 'accepted') inv.acceptedAt = now();
-  if (status === 'rejected') inv.rejectedAt = now();
-
-  await Promise.all([
-    kvPut({
-      pk: `gameInvite:${gameInviteId}`,
-      type: 'gameInvite',
-      owner: inv.toPlayerId,
-      expiresAt: inv.expiresAt,
-      data: inv
-    }),
-    kvPut({
-      pk: `gameInviteInbox:${inv.toPlayerId}:${gameInviteId}`,
-      type: 'gameInviteInbox',
-      owner: inv.toPlayerId,
-      expiresAt: inv.expiresAt,
-      data: inv
-    }),
-    kvPut({
-      pk: `gameInviteOutbox:${inv.fromPlayerId}:${gameInviteId}`,
-      type: 'gameInviteOutbox',
-      owner: inv.fromPlayerId,
-      expiresAt: inv.expiresAt,
-      data: inv
-    })
-  ]);
-
-  return { ok: true, invite: inv };
 }
 
 // ===== FRIENDS / E2EE V2 =====
@@ -3239,24 +3154,884 @@ async function actionVoiceCallEnd(event, body) {
   return { ok: true, ended: true };
 }
 
-async function actionLeaderboardGet(event, body) {
-  const rows = await kvPrefix('profile:', 1000);
-  const leaders = rows.map(payload)
-    .filter(p => p.matches > 0)
-    .sort((a, b) => (b.rating || 1000) - (a.rating || 1000))
-    .slice(0, 50)
-    .map(p => ({
-       playerId: p.friendId,
-       displayName: p.displayName,
-       avatarUrl: p.avatarUrl,
-       rating: p.rating || 1000,
-       wins: p.wins || 0,
-       matches: p.matches || 0
-    }));
+const RANKED_GAME_ID = 'war_hearts';
+const RANKED_BOARD_SIZE = 10;
+const RANKED_FLEET = [4, 3, 3, 2, 2, 2, 1, 1, 1, 1];
+const RANKED_MAX_TRANSCRIPT = 200;
+const RANKED_SETTLEMENT_HISTORY = 100;
+
+function rankedMatchKey(matchId) {
+  return `rankedMatch:${sanitizeId(matchId, 120)}`;
+}
+
+function rankedPoint(raw) {
+  return {
+    x: Math.floor(num(raw?.x, -1)),
+    y: Math.floor(num(raw?.y, -1))
+  };
+}
+
+function rankedPointKey(point) {
+  return `${point.x}:${point.y}`;
+}
+
+function isRankedPoint(point) {
+  return Number.isInteger(point.x) &&
+    Number.isInteger(point.y) &&
+    point.x >= 0 &&
+    point.y >= 0 &&
+    point.x < RANKED_BOARD_SIZE &&
+    point.y < RANKED_BOARD_SIZE;
+}
+
+function normalizeRankedReveal(raw) {
+  const points = (Array.isArray(raw?.ships) ? raw.ships : [])
+    .map(rankedPoint)
+    .filter(isRankedPoint)
+    .sort((a, b) => a.y - b.y || a.x - b.x);
+
+  return {
+    size: RANKED_BOARD_SIZE,
+    ships: points
+  };
+}
+
+function canonicalRankedReveal(reveal) {
+  return JSON.stringify(normalizeRankedReveal(reveal));
+}
+
+function collectRankedShips(reveal) {
+  const points = normalizeRankedReveal(reveal).ships;
+  const all = new Set(points.map(rankedPointKey));
+  const seen = new Set();
+  const ships = [];
+
+  for (const point of points) {
+    const firstKey = rankedPointKey(point);
+    if (seen.has(firstKey)) continue;
+
+    const stack = [point];
+    const cells = [];
+
+    while (stack.length) {
+      const current = stack.pop();
+      const key = rankedPointKey(current);
+
+      if (seen.has(key) || !all.has(key)) continue;
+
+      seen.add(key);
+      cells.push(current);
+
+      [
+        { x: current.x + 1, y: current.y },
+        { x: current.x - 1, y: current.y },
+        { x: current.x, y: current.y + 1 },
+        { x: current.x, y: current.y - 1 }
+      ].forEach(next => {
+        if (isRankedPoint(next) && all.has(rankedPointKey(next))) {
+          stack.push(next);
+        }
+      });
+    }
+
+    ships.push(cells);
+  }
+
+  return ships;
+}
+
+function validateRankedReveal(reveal) {
+  const normalized = normalizeRankedReveal(reveal);
+  const pointKeys = normalized.ships.map(rankedPointKey);
+
+  if (num(reveal?.size, RANKED_BOARD_SIZE) !== RANKED_BOARD_SIZE) {
+    return { ok: false, reason: 'ranked_bad_board_size' };
+  }
+
+  if (
+    pointKeys.length !== 20 ||
+    new Set(pointKeys).size !== pointKeys.length
+  ) {
+    return { ok: false, reason: 'ranked_bad_ship_cells' };
+  }
+
+  const ships = collectRankedShips(normalized);
+  const sizes = ships
+    .map(ship => ship.length)
+    .sort((a, b) => b - a);
+
+  if (sizes.join(',') !== RANKED_FLEET.join(',')) {
+    return {
+      ok: false,
+      reason: 'ranked_bad_fleet_composition'
+    };
+  }
+
+  const shipByCell = new Map();
+
+  ships.forEach((ship, index) => {
+    const xs = new Set(ship.map(point => point.x));
+    const ys = new Set(ship.map(point => point.y));
+
+    if (xs.size > 1 && ys.size > 1) {
+      shipByCell.clear();
+      return;
+    }
+
+    const sorted = ship.slice().sort((a, b) =>
+      xs.size === 1 ? a.y - b.y : a.x - b.x
+    );
+
+    for (let i = 1; i < sorted.length; i++) {
+      const previous = sorted[i - 1];
+      const current = sorted[i];
+      const continuous = xs.size === 1
+        ? current.x === previous.x && current.y === previous.y + 1
+        : current.y === previous.y && current.x === previous.x + 1;
+
+      if (!continuous) {
+        shipByCell.clear();
+        return;
+      }
+    }
+
+    ship.forEach(point => {
+      shipByCell.set(rankedPointKey(point), index);
+    });
+  });
+
+  if (!shipByCell.size) {
+    return { ok: false, reason: 'ranked_bent_or_gapped_ship' };
+  }
+
+  for (const [key, shipIndex] of shipByCell) {
+    const [x, y] = key.split(':').map(Number);
+
+    for (let dy = -1; dy <= 1; dy++) {
+      for (let dx = -1; dx <= 1; dx++) {
+        if (!dx && !dy) continue;
+
+        const other = shipByCell.get(`${x + dx}:${y + dy}`);
+        if (other !== undefined && other !== shipIndex) {
+          return { ok: false, reason: 'ranked_ships_touch' };
+        }
+      }
+    }
+  }
+
   return {
     ok: true,
-    version: 1,
-    legacyFrozen: true,
+    reveal: normalized,
+    ships
+  };
+}
+
+function normalizeRankedTranscript(raw) {
+  if (!Array.isArray(raw) || raw.length > RANKED_MAX_TRANSCRIPT) {
+    throw new Error('bad_ranked_transcript');
+  }
+
+  return raw.map((item, index) => {
+    const sunkCells = (Array.isArray(item?.sunkCells)
+      ? item.sunkCells
+      : [])
+      .map(rankedPoint)
+      .filter(isRankedPoint)
+      .sort((a, b) => a.y - b.y || a.x - b.x);
+
+    return {
+      turn: Math.floor(num(item?.turn, index + 1)),
+      shotId: sanitizeId(item?.shotId, 140),
+      shooterId: sanitizeId(item?.shooterId, 96),
+      x: Math.floor(num(item?.x, -1)),
+      y: Math.floor(num(item?.y, -1)),
+      result: sanitizeId(item?.result, 20),
+      sunkCells
+    };
+  });
+}
+
+function normalizeRankedSubmission(raw, playerId) {
+  const submission = raw && typeof raw === 'object' ? raw : {};
+  const transcript = normalizeRankedTranscript(submission.transcript);
+
+  const normalized = {
+    playerId,
+    result: sanitizeId(submission.result, 20),
+    firstPlayerId: sanitizeId(submission.firstPlayerId, 96),
+    boardReveal: normalizeRankedReveal(submission.boardReveal),
+    boardSalt: safe(submission.boardSalt).slice(0, 160),
+    boardCommit: safe(submission.boardCommit).slice(0, 128),
+    transcript,
+    transcriptHash: safe(submission.transcriptHash).slice(0, 128),
+    submittedAt: now()
+  };
+
+  if (!['win', 'loss'].includes(normalized.result)) {
+    throw new Error('bad_ranked_result');
+  }
+
+  const actualTranscriptHash = hash(
+    stableStringify(normalized.transcript)
+  );
+
+  if (
+    !normalized.transcriptHash ||
+    normalized.transcriptHash !== actualTranscriptHash
+  ) {
+    throw new Error('bad_ranked_transcript_hash');
+  }
+
+  if (
+    !normalized.boardSalt ||
+    !normalized.boardCommit ||
+    !normalized.firstPlayerId
+  ) {
+    throw new Error('bad_ranked_submission');
+  }
+
+  return normalized;
+}
+
+function otherRankedPlayer(participants, playerId) {
+  return participants.find(id => id !== playerId) || '';
+}
+
+function sameRankedCellSet(left, right) {
+  const a = new Set((left || []).map(rankedPointKey));
+  const b = new Set((right || []).map(rankedPointKey));
+
+  return a.size === b.size &&
+    [...a].every(key => b.has(key));
+}
+
+function validateRankedTranscript({
+  transcript,
+  participants,
+  firstPlayerId,
+  boards
+}) {
+  if (!transcript.length) {
+    return { ok: false, reason: 'ranked_empty_transcript' };
+  }
+
+  if (!participants.includes(firstPlayerId)) {
+    return { ok: false, reason: 'ranked_bad_first_player' };
+  }
+
+  const boardData = new Map();
+  const fired = new Map();
+
+  for (const playerId of participants) {
+    const check = validateRankedReveal(boards[playerId]);
+    if (!check.ok) return check;
+
+    boardData.set(playerId, {
+      points: new Set(check.reveal.ships.map(rankedPointKey)),
+      ships: check.ships
+    });
+    fired.set(playerId, new Set());
+  }
+
+  let expectedShooter = firstPlayerId;
+  let winnerId = '';
+
+  for (let index = 0; index < transcript.length; index++) {
+    const event = transcript[index];
+
+    if (event.turn !== index + 1) {
+      return { ok: false, reason: 'ranked_turn_sequence_invalid' };
+    }
+
+    if (
+      !event.shotId ||
+      event.shooterId !== expectedShooter ||
+      !participants.includes(event.shooterId) ||
+      !isRankedPoint(event) ||
+      !['miss', 'hit', 'sunk'].includes(event.result)
+    ) {
+      return { ok: false, reason: 'ranked_shot_invalid' };
+    }
+
+    const targetId = otherRankedPlayer(
+      participants,
+      event.shooterId
+    );
+    const targetBoard = boardData.get(targetId);
+    const shooterShots = fired.get(event.shooterId);
+    const shotKey = rankedPointKey(event);
+
+    if (shooterShots.has(shotKey)) {
+      return { ok: false, reason: 'ranked_duplicate_shot' };
+    }
+
+    const hasShip = targetBoard.points.has(shotKey);
+    shooterShots.add(shotKey);
+
+    let expectedResult = 'miss';
+    let expectedSunkCells = [];
+
+    if (hasShip) {
+      const ship = targetBoard.ships.find(cells =>
+        cells.some(point => rankedPointKey(point) === shotKey)
+      ) || [];
+
+      const sunk = ship.length > 0 && ship.every(point =>
+        shooterShots.has(rankedPointKey(point))
+      );
+
+      expectedResult = sunk ? 'sunk' : 'hit';
+      expectedSunkCells = sunk ? ship : [];
+    }
+
+    if (event.result !== expectedResult) {
+      return {
+        ok: false,
+        reason: 'ranked_shot_result_mismatch'
+      };
+    }
+
+    if (
+      expectedResult === 'sunk' &&
+      !sameRankedCellSet(event.sunkCells, expectedSunkCells)
+    ) {
+      return {
+        ok: false,
+        reason: 'ranked_sunk_cells_mismatch'
+      };
+    }
+
+    const targetDefeated = [...targetBoard.points]
+      .every(key => shooterShots.has(key));
+
+    if (targetDefeated) {
+      if (index !== transcript.length - 1) {
+        return {
+          ok: false,
+          reason: 'ranked_transcript_after_finish'
+        };
+      }
+
+      winnerId = event.shooterId;
+      break;
+    }
+
+    expectedShooter = event.result === 'miss'
+      ? targetId
+      : event.shooterId;
+  }
+
+  if (!winnerId) {
+    return { ok: false, reason: 'ranked_match_not_finished' };
+  }
+
+  return {
+    ok: true,
+    winnerId,
+    loserId: otherRankedPlayer(participants, winnerId),
+    turns: transcript.length
+  };
+}
+
+function validateRankedSubmissions(match) {
+  const participants = Array.isArray(match.participants)
+    ? match.participants
+    : [];
+
+  if (participants.length !== 2 || new Set(participants).size !== 2) {
+    return { ok: false, reason: 'ranked_participants_invalid' };
+  }
+
+  const left = match.submissions?.[participants[0]];
+  const right = match.submissions?.[participants[1]];
+
+  if (!left || !right) {
+    return { ok: false, reason: 'ranked_submissions_pending' };
+  }
+
+  if (
+    left.firstPlayerId !== right.firstPlayerId ||
+    left.transcriptHash !== right.transcriptHash ||
+    stableStringify(left.transcript) !== stableStringify(right.transcript)
+  ) {
+    return { ok: false, reason: 'ranked_transcripts_disagree' };
+  }
+
+  if (left.result === right.result) {
+    return { ok: false, reason: 'ranked_results_disagree' };
+  }
+
+  for (const submission of [left, right]) {
+    const layout = validateRankedReveal(submission.boardReveal);
+    if (!layout.ok) return layout;
+
+    const expectedCommit = hash(
+      `${submission.boardSalt}:${canonicalRankedReveal(submission.boardReveal)}`
+    );
+
+    if (expectedCommit !== submission.boardCommit) {
+      return { ok: false, reason: 'ranked_board_commit_mismatch' };
+    }
+  }
+
+  const transcriptCheck = validateRankedTranscript({
+    transcript: left.transcript,
+    participants,
+    firstPlayerId: left.firstPlayerId,
+    boards: {
+      [participants[0]]: left.boardReveal,
+      [participants[1]]: right.boardReveal
+    }
+  });
+
+  if (!transcriptCheck.ok) return transcriptCheck;
+
+  if (
+    match.submissions[transcriptCheck.winnerId]?.result !== 'win' ||
+    match.submissions[transcriptCheck.loserId]?.result !== 'loss'
+  ) {
+    return { ok: false, reason: 'ranked_winner_result_mismatch' };
+  }
+
+  return transcriptCheck;
+}
+
+async function applyRankedProfileSettlement({
+  playerId,
+  matchId,
+  won,
+  delta
+}) {
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const row = await kvGet(`profile:${playerId}`);
+    if (!row) throw new Error('ranked_profile_not_found');
+
+    const profile = payload(row);
+    const settled = Array.isArray(profile.rankedSettlements)
+      ? profile.rankedSettlements.map(value => sanitizeId(value, 120))
+      : [];
+
+    if (settled.includes(matchId)) {
+      return { ok: true, duplicate: true };
+    }
+
+    const currentRating = Math.max(100, num(profile.rating, 1000));
+    const matches = Math.max(
+      num(profile.rankedMatches),
+      num(profile.matches)
+    );
+
+    const next = {
+      ...profile,
+      rating: Math.max(100, Math.min(3000, currentRating + delta)),
+      rankedMatches: matches + 1,
+      rankedWins: Math.max(
+        num(profile.rankedWins),
+        num(profile.wins)
+      ) + (won ? 1 : 0),
+      rankedLosses: Math.max(
+        num(profile.rankedLosses),
+        num(profile.losses)
+      ) + (won ? 0 : 1),
+      rankedV2: true,
+      rankedUpdatedAt: now(),
+      rankedSettlements: [...settled, matchId]
+        .slice(-RANKED_SETTLEMENT_HISTORY)
+    };
+
+    const changed = await kvCompareAndPut({
+      row,
+      type: 'profile',
+      owner: playerId,
+      data: next
+    });
+
+    if (changed) {
+      return {
+        ok: true,
+        rating: next.rating,
+        matches: next.rankedMatches
+      };
+    }
+  }
+
+  throw new Error('ranked_profile_settlement_conflict');
+}
+
+async function settleRankedMatch(matchId) {
+  const key = rankedMatchKey(matchId);
+
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const row = await kvGet(key);
+    if (!row) throw new Error('ranked_match_not_found');
+
+    const match = payload(row);
+
+    if (match.status === 'settled' || match.status === 'disputed') {
+      return match;
+    }
+
+    if (Object.keys(match.submissions || {}).length < 2) {
+      return match;
+    }
+
+    if (match.status === 'pending') {
+      const check = validateRankedSubmissions(match);
+
+      if (!check.ok) {
+        const disputed = {
+          ...match,
+          status: 'disputed',
+          validation: check,
+          updatedAt: now()
+        };
+
+        if (await kvCompareAndPut({
+          row,
+          type: 'rankedMatch',
+          owner: match.roomId,
+          expiresAt: num(row.expires_at),
+          data: disputed
+        })) {
+          return disputed;
+        }
+
+        continue;
+      }
+
+      const [winnerProfile, loserProfile] = await Promise.all([
+        kvGet(`profile:${check.winnerId}`),
+        kvGet(`profile:${check.loserId}`)
+      ]);
+
+      const winnerRating = Math.max(
+        100,
+        num(payload(winnerProfile).rating, 1000)
+      );
+      const loserRating = Math.max(
+        100,
+        num(payload(loserProfile).rating, 1000)
+      );
+      const expected = 1 / (
+        1 + Math.pow(10, (loserRating - winnerRating) / 400)
+      );
+      const winnerDelta = Math.max(1, Math.round(24 * (1 - expected)));
+
+      const settling = {
+        ...match,
+        status: 'settling',
+        validation: check,
+        settlement: {
+          id: `settlement:${matchId}`,
+          winnerId: check.winnerId,
+          loserId: check.loserId,
+          winnerDelta,
+          loserDelta: -winnerDelta,
+          createdAt: now()
+        },
+        updatedAt: now()
+      };
+
+      if (!await kvCompareAndPut({
+        row,
+        type: 'rankedMatch',
+        owner: match.roomId,
+        expiresAt: num(row.expires_at),
+        data: settling
+      })) {
+        continue;
+      }
+    }
+
+    const latestRow = await kvGet(key);
+    const latest = payload(latestRow);
+    const settlement = latest.settlement;
+
+    if (!settlement?.winnerId || !settlement?.loserId) {
+      throw new Error('ranked_settlement_plan_missing');
+    }
+
+    const [winner, loser] = await Promise.all([
+      applyRankedProfileSettlement({
+        playerId: settlement.winnerId,
+        matchId,
+        won: true,
+        delta: num(settlement.winnerDelta)
+      }),
+      applyRankedProfileSettlement({
+        playerId: settlement.loserId,
+        matchId,
+        won: false,
+        delta: num(settlement.loserDelta)
+      })
+    ]);
+
+    const settled = {
+      ...latest,
+      status: 'settled',
+      settlement: {
+        ...settlement,
+        winnerRating: winner.rating || 0,
+        loserRating: loser.rating || 0,
+        settledAt: now()
+      },
+      settledAt: now(),
+      updatedAt: now()
+    };
+
+    if (await kvCompareAndPut({
+      row: latestRow,
+      type: 'rankedMatch',
+      owner: latest.roomId,
+      expiresAt: num(latestRow.expires_at),
+      data: settled
+    })) {
+      return settled;
+    }
+  }
+
+  throw new Error('ranked_settlement_conflict');
+}
+
+function publicRankedMatch(match, playerId) {
+  return {
+    matchId: match.matchId,
+    roomId: match.roomId,
+    gameId: match.gameId,
+    status: match.status,
+    participants: match.participants,
+    submitted: !!match.submissions?.[playerId],
+    submissions: Object.keys(match.submissions || {}).length,
+    validation: match.validation || null,
+    settlement: match.settlement || null,
+    createdAt: num(match.createdAt),
+    updatedAt: num(match.updatedAt),
+    settledAt: num(match.settledAt)
+  };
+}
+
+async function actionRankedMatchPrepare(event, body) {
+  const { playerId } = await requirePlayer(event, body);
+  const roomId = sanitizeId(body.roomId);
+  const roomSecret = safe(body.roomSecret);
+  const roomRow = roomId ? await kvGet(`room:${roomId}`) : null;
+  const room = payload(roomRow);
+
+  if (!roomRow || room.roomSecretHash !== hash(roomSecret)) {
+    return { ok: false, reason: 'room_not_found' };
+  }
+
+  if (
+    room.gameId !== RANKED_GAME_ID ||
+    room.ranked !== true ||
+    room.matchMode !== 'ranked'
+  ) {
+    return { ok: false, reason: 'ranked_room_required' };
+  }
+
+  if (!isRoomParticipant(room, playerId)) {
+    return { ok: false, reason: 'room_forbidden' };
+  }
+
+  const participants = [
+    sanitizeId(room.hostPlayerId),
+    sanitizeId(room.guestPlayerId)
+  ].filter(Boolean);
+
+  if (participants.length !== 2 || new Set(participants).size !== 2) {
+    return { ok: false, reason: 'ranked_two_players_required' };
+  }
+
+  let matchId = sanitizeId(room.rankedMatchId, 120);
+
+  if (!matchId) {
+    const candidate = rid('ranked');
+    const updatedRoom = {
+      ...room,
+      rankedMatchId: candidate,
+      rankedPreparedAt: now(),
+      updatedAt: now()
+    };
+
+    const changed = await kvCompareAndPut({
+      row: roomRow,
+      type: 'room',
+      owner: room.hostPlayerId,
+      expiresAt: num(roomRow.expires_at),
+      data: updatedRoom
+    });
+
+    if (changed) {
+      matchId = candidate;
+
+      await kvPut({
+        pk: rankedMatchKey(matchId),
+        type: 'rankedMatch',
+        owner: roomId,
+        expiresAt: num(room.reconnectUntil) || now() + CFG.roomTtlMs,
+        data: {
+          version: 2,
+          matchId,
+          roomId,
+          gameId: RANKED_GAME_ID,
+          participants,
+          status: 'pending',
+          submissions: {},
+          createdAt: now(),
+          updatedAt: now()
+        }
+      });
+    } else {
+      const latestRoom = payload(await kvGet(`room:${roomId}`));
+      matchId = sanitizeId(latestRoom.rankedMatchId, 120);
+    }
+  }
+
+  const matchRow = matchId
+    ? await kvGet(rankedMatchKey(matchId))
+    : null;
+  const match = payload(matchRow);
+
+  if (!matchRow) {
+    throw new Error('ranked_match_not_ready');
+  }
+
+  return {
+    ok: true,
+    playerId,
+    peerPlayerId: otherRankedPlayer(participants, playerId),
+    match: publicRankedMatch(match, playerId)
+  };
+}
+
+async function actionRankedMatchSubmit(event, body) {
+  const { playerId } = await requirePlayer(event, body);
+  const matchId = sanitizeId(body.matchId, 120);
+  const key = rankedMatchKey(matchId);
+
+  if (!matchId) throw new Error('ranked_match_required');
+
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const row = await kvGet(key);
+    if (!row) throw new Error('ranked_match_not_found');
+
+    const match = payload(row);
+
+    if (!match.participants?.includes(playerId)) {
+      throw new Error('ranked_match_forbidden');
+    }
+
+    if (match.status === 'settled' || match.status === 'disputed') {
+      return {
+        ok: true,
+        duplicate: true,
+        match: publicRankedMatch(match, playerId)
+      };
+    }
+
+    const submission = normalizeRankedSubmission(
+      body.submission || body,
+      playerId
+    );
+    const old = match.submissions?.[playerId];
+
+    if (old) {
+      if (
+        old.transcriptHash !== submission.transcriptHash ||
+        old.boardCommit !== submission.boardCommit ||
+        old.result !== submission.result
+      ) {
+        throw new Error('ranked_submission_conflict');
+      }
+
+      const settled = await settleRankedMatch(matchId);
+      return {
+        ok: true,
+        duplicate: true,
+        match: publicRankedMatch(settled, playerId)
+      };
+    }
+
+    const next = {
+      ...match,
+      submissions: {
+        ...(match.submissions || {}),
+        [playerId]: submission
+      },
+      updatedAt: now()
+    };
+
+    if (!await kvCompareAndPut({
+      row,
+      type: 'rankedMatch',
+      owner: match.roomId,
+      expiresAt: num(row.expires_at),
+      data: next
+    })) {
+      continue;
+    }
+
+    const settled = await settleRankedMatch(matchId);
+
+    return {
+      ok: true,
+      duplicate: false,
+      match: publicRankedMatch(settled, playerId)
+    };
+  }
+
+  throw new Error('ranked_submission_conflict');
+}
+
+async function actionRankedMatchStatus(event, body) {
+  const { playerId } = await requirePlayer(event, body);
+  const matchId = sanitizeId(body.matchId, 120);
+  const row = matchId
+    ? await kvGet(rankedMatchKey(matchId))
+    : null;
+  const match = payload(row);
+
+  if (!row) throw new Error('ranked_match_not_found');
+  if (!match.participants?.includes(playerId)) {
+    throw new Error('ranked_match_forbidden');
+  }
+
+  const current = match.status === 'settling'
+    ? await settleRankedMatch(matchId)
+    : match;
+
+  return {
+    ok: true,
+    match: publicRankedMatch(current, playerId)
+  };
+}
+
+async function actionLeaderboardV2Get(event, body) {
+  await requirePlayer(event, body);
+
+  const rows = await kvPrefix('profile:', 1000);
+  const leaders = rows
+    .map(payload)
+    .filter(profile => num(profile.rankedMatches) > 0)
+    .sort((a, b) =>
+      num(b.rating, 1000) - num(a.rating, 1000) ||
+      num(b.rankedWins) - num(a.rankedWins)
+    )
+    .slice(0, 50)
+    .map(profile => ({
+      playerId: profile.friendId,
+      displayName: profile.displayName,
+      avatarUrl: profile.avatarUrl,
+      rating: num(profile.rating, 1000),
+      wins: num(profile.rankedWins),
+      losses: num(profile.rankedLosses),
+      matches: num(profile.rankedMatches)
+    }));
+
+  return {
+    ok: true,
+    version: 2,
+    legacyFrozen: false,
     leaders
   };
 }
@@ -3549,12 +4324,10 @@ const ACTIONS = {
   room_set_mode: actionRoomSetMode,
   signal_send: actionSignalSend,
   signal_poll: actionSignalPoll,
-  game_invite_create: actionGameInviteCreate,
-  game_invite_poll: actionGameInvitePoll,
-  game_invite_accept: (e, b) => actionGameInviteSet(e, b, 'accepted'),
-  game_invite_reject: (e, b) => actionGameInviteSet(e, b, 'rejected'),
-  game_invite_cancel: (e, b) => actionGameInviteSet(e, b, 'cancelled'),
-  leaderboard_get: actionLeaderboardGet,
+  ranked_match_prepare: actionRankedMatchPrepare,
+  ranked_match_submit: actionRankedMatchSubmit,
+  ranked_match_status: actionRankedMatchStatus,
+  leaderboard_v2_get: actionLeaderboardV2Get,
   rtc_config: actionRtcConfig,
   webpush_config: actionWebPushConfig,
   webpush_subscribe: actionWebPushSubscribe,
