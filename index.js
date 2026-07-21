@@ -417,6 +417,49 @@ async function kvPut({ pk, type = '', owner = '', expiresAt = 0, data = {} }) {
   return true;
 }
 
+async function kvInsert({
+  pk,
+  type = '',
+  owner = '',
+  expiresAt = 0,
+  data = {}
+}) {
+  await query(`
+    DECLARE $pk AS Utf8;
+    DECLARE $type AS Utf8;
+    DECLARE $owner AS Utf8;
+    DECLARE $updated_at AS Uint64;
+    DECLARE $expires_at AS Uint64;
+    DECLARE $payload_json AS Utf8;
+
+    INSERT INTO ${TABLE} (
+      pk,
+      type,
+      owner,
+      updated_at,
+      expires_at,
+      payload_json
+    )
+    VALUES (
+      $pk,
+      $type,
+      $owner,
+      $updated_at,
+      $expires_at,
+      $payload_json
+    );
+  `, {
+    '$pk': tvUtf8(pk),
+    '$type': tvUtf8(type),
+    '$owner': tvUtf8(owner),
+    '$updated_at': tvUint64(now()),
+    '$expires_at': tvUint64(expiresAt),
+    '$payload_json': tvUtf8(JSON.stringify(data || {}))
+  });
+
+  return true;
+}
+
 async function kvCompareAndPut({
   row,
   type = '',
@@ -3197,11 +3240,53 @@ function normalizeShardWallet(raw, playerId) {
     ? raw
     : {};
 
+  const locks = Object.fromEntries(
+    Object.entries(
+      wallet.locks && typeof wallet.locks === 'object'
+        ? wallet.locks
+        : {}
+    )
+      .map(([matchId, amount]) => [
+        sanitizeId(matchId, 120),
+        Math.max(0, Math.floor(num(amount)))
+      ])
+      .filter(([matchId, amount]) => matchId && amount > 0)
+      .slice(-100)
+  );
+
+  const operations = Object.fromEntries(
+    Object.entries(
+      wallet.operations && typeof wallet.operations === 'object'
+        ? wallet.operations
+        : {}
+    )
+      .map(([operationId, operation]) => [
+        sanitizeId(operationId, 180),
+        {
+          kind: sanitizeId(operation?.kind, 30),
+          matchId: sanitizeId(operation?.matchId, 120),
+          amount: Math.max(0, Math.floor(num(operation?.amount))),
+          at: num(operation?.at)
+        }
+      ])
+      .filter(([operationId]) => operationId)
+      .sort((a, b) => num(a[1]?.at) - num(b[1]?.at))
+      .slice(-300)
+  );
+
+  const lockedByRecords = Object.values(locks)
+    .reduce((sum, amount) => sum + amount, 0);
+
   return {
     version: SHARD_WALLET_VERSION,
     playerId: sanitizeId(playerId, 96),
     balance: Math.max(0, Math.floor(num(wallet.balance))),
-    locked: Math.max(0, Math.floor(num(wallet.locked))),
+    locked: Math.max(
+      lockedByRecords,
+      Math.max(0, Math.floor(num(wallet.locked)))
+    ),
+    locks,
+    operations,
     earned: Math.max(0, Math.floor(num(wallet.earned))),
     spent: Math.max(0, Math.floor(num(wallet.spent))),
     purchasedAvatarIds: [...new Set(
@@ -3382,6 +3467,598 @@ async function actionWalletPurchaseAvatar(event, body) {
   }
 
   throw new Error('wallet_purchase_conflict');
+}
+
+const RANKED_STAKE_AMOUNT = 100;
+const ESCROW_VERSION = 1;
+const ESCROW_OPERATION_HISTORY = 300;
+
+function rankedEscrowKey(matchId) {
+  return `escrow:${sanitizeId(matchId, 120)}`;
+}
+
+function walletOperationId(kind, matchId, playerId) {
+  return [
+    sanitizeId(kind, 30),
+    sanitizeId(matchId, 120),
+    sanitizeId(playerId, 96)
+  ].join(':');
+}
+
+function normalizeRankedEscrow(raw = {}) {
+  const participants = [...new Set(
+    (Array.isArray(raw.participants)
+      ? raw.participants
+      : [])
+      .map(playerId => sanitizeId(playerId, 96))
+      .filter(Boolean)
+  )].slice(0, 2);
+
+  return {
+    version: ESCROW_VERSION,
+    matchId: sanitizeId(raw.matchId, 120),
+    roomId: sanitizeId(raw.roomId, 120),
+    participants,
+    amountEach: Math.max(
+      0,
+      Math.floor(num(raw.amountEach, RANKED_STAKE_AMOUNT))
+    ),
+    total: Math.max(
+      0,
+      Math.floor(num(
+        raw.total,
+        participants.length * RANKED_STAKE_AMOUNT
+      ))
+    ),
+    status: sanitizeId(raw.status || 'locking', 30),
+    locks:
+      raw.locks && typeof raw.locks === 'object'
+        ? raw.locks
+        : {},
+    operations:
+      raw.operations && typeof raw.operations === 'object'
+        ? raw.operations
+        : {},
+    winnerId: sanitizeId(raw.winnerId, 96),
+    loserId: sanitizeId(raw.loserId, 96),
+    createdAt: num(raw.createdAt) || now(),
+    fundedAt: num(raw.fundedAt),
+    paidAt: num(raw.paidAt),
+    refundedAt: num(raw.refundedAt),
+    updatedAt: num(raw.updatedAt) || now()
+  };
+}
+
+function publicRankedEscrow(escrow) {
+  const data = normalizeRankedEscrow(escrow);
+
+  return {
+    required: true,
+    version: data.version,
+    status: data.status,
+    stakeEach: data.amountEach,
+    escrow: data.total,
+    lockedPlayers: data.participants.filter(
+      playerId => data.locks?.[playerId]?.status === 'locked'
+    ).length,
+    participants: data.participants.length,
+    fundedAt: data.fundedAt,
+    paidAt: data.paidAt,
+    refundedAt: data.refundedAt,
+    updatedAt: data.updatedAt
+  };
+}
+
+async function getOrCreateRankedEscrow(match) {
+  const key = rankedEscrowKey(match.matchId);
+  let row = await kvGet(key);
+
+  if (row) {
+    return {
+      row,
+      escrow: normalizeRankedEscrow(payload(row))
+    };
+  }
+
+  const createdAt = now();
+  const escrow = normalizeRankedEscrow({
+    matchId: match.matchId,
+    roomId: match.roomId,
+    participants: match.participants,
+    amountEach: RANKED_STAKE_AMOUNT,
+    total: RANKED_STAKE_AMOUNT * 2,
+    status: 'locking',
+    locks: {},
+    operations: {},
+    createdAt,
+    updatedAt: createdAt
+  });
+
+  try {
+    await kvInsert({
+      pk: key,
+      type: 'escrow',
+      owner: match.roomId,
+      expiresAt:
+        num(match.expiresAt) ||
+        createdAt + CFG.roomTtlMs,
+      data: escrow
+    });
+  } catch {
+    // Параллельный участник мог создать escrow первым.
+  }
+
+  row = await kvGet(key);
+  if (!row) throw new Error('ranked_escrow_create_failed');
+
+  return {
+    row,
+    escrow: normalizeRankedEscrow(payload(row))
+  };
+}
+
+function trimWalletOperations(operations = {}) {
+  return Object.fromEntries(
+    Object.entries(operations)
+      .sort((a, b) => num(a[1]?.at) - num(b[1]?.at))
+      .slice(-ESCROW_OPERATION_HISTORY)
+  );
+}
+
+async function applyWalletEscrowOperation({
+  playerId,
+  matchId,
+  kind,
+  amount,
+  won = false
+}) {
+  const operationKind = kind === 'payout'
+    ? 'payout'
+    : kind;
+  const operationId = walletOperationId(
+    operationKind,
+    matchId,
+    playerId
+  );
+  const stake = Math.max(0, Math.floor(num(amount)));
+
+  if (!stake) throw new Error('wallet_operation_amount_invalid');
+
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const { row, wallet } =
+      await getOrCreateShardWallet(playerId);
+
+    if (wallet.operations?.[operationId]) {
+      return {
+        ok: true,
+        duplicate: true,
+        operationId,
+        wallet
+      };
+    }
+
+    const locks = { ...(wallet.locks || {}) };
+    const currentLock = Math.max(
+      0,
+      Math.floor(num(locks[matchId]))
+    );
+
+    let nextBalance = wallet.balance;
+    let nextLocked = wallet.locked;
+    let nextEarned = wallet.earned;
+    let nextSpent = wallet.spent;
+
+    if (kind === 'stake') {
+      if (currentLock > 0 && currentLock !== stake) {
+        throw new Error('wallet_stake_lock_conflict');
+      }
+
+      if (!currentLock) {
+        const spendable = Math.max(
+          0,
+          wallet.balance - wallet.locked
+        );
+
+        if (spendable < stake) {
+          const error = new Error('wallet_insufficient_shards');
+          error.httpStatus = 409;
+          throw error;
+        }
+
+        locks[matchId] = stake;
+        nextLocked += stake;
+      }
+    } else if (kind === 'payout') {
+      if (currentLock < stake) {
+        throw new Error('wallet_payout_lock_missing');
+      }
+
+      delete locks[matchId];
+      nextLocked = Math.max(0, nextLocked - stake);
+
+      if (won) {
+        nextBalance += stake;
+        nextEarned += stake;
+      } else {
+        if (nextBalance < stake) {
+          throw new Error('wallet_payout_balance_invalid');
+        }
+
+        nextBalance -= stake;
+        nextSpent += stake;
+      }
+    } else if (kind === 'refund') {
+      if (currentLock > 0) {
+        delete locks[matchId];
+        nextLocked = Math.max(0, nextLocked - currentLock);
+      }
+    } else {
+      throw new Error('wallet_operation_kind_invalid');
+    }
+
+    const at = now();
+    const next = {
+      ...wallet,
+      balance: nextBalance,
+      locked: nextLocked,
+      locks,
+      operations: trimWalletOperations({
+        ...(wallet.operations || {}),
+        [operationId]: {
+          kind,
+          matchId,
+          amount: stake,
+          at
+        }
+      }),
+      earned: nextEarned,
+      spent: nextSpent,
+      updatedAt: at
+    };
+
+    const changed = await kvCompareAndPut({
+      row,
+      type: 'wallet',
+      owner: playerId,
+      data: next
+    });
+
+    if (!changed) continue;
+
+    return {
+      ok: true,
+      duplicate: false,
+      operationId,
+      wallet: next
+    };
+  }
+
+  throw new Error('wallet_operation_conflict');
+}
+
+async function updateRankedEscrow(matchId, updater) {
+  const key = rankedEscrowKey(matchId);
+
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const row = await kvGet(key);
+    if (!row) throw new Error('ranked_escrow_not_found');
+
+    const escrow = normalizeRankedEscrow(payload(row));
+    const next = normalizeRankedEscrow(
+      updater(escrow) || escrow
+    );
+
+    if (
+      stableStringify(next) === stableStringify(escrow)
+    ) {
+      return escrow;
+    }
+
+    if (await kvCompareAndPut({
+      row,
+      type: 'escrow',
+      owner: escrow.roomId,
+      expiresAt: num(row.expires_at),
+      data: next
+    })) {
+      return next;
+    }
+  }
+
+  throw new Error('ranked_escrow_conflict');
+}
+
+async function reconcileEscrowFunding(match) {
+  await getOrCreateRankedEscrow(match);
+
+  const walletLocks = {};
+
+  for (const playerId of match.participants || []) {
+    const { wallet } = await getOrCreateShardWallet(playerId);
+    walletLocks[playerId] = Math.max(
+      0,
+      Math.floor(num(wallet.locks?.[match.matchId]))
+    );
+  }
+
+  return updateRankedEscrow(match.matchId, escrow => {
+    if (
+      ['paying', 'paid', 'refunding', 'refunded']
+        .includes(escrow.status)
+    ) {
+      return escrow;
+    }
+
+    const locks = { ...(escrow.locks || {}) };
+
+    escrow.participants.forEach(playerId => {
+      if (walletLocks[playerId] >= escrow.amountEach) {
+        locks[playerId] = {
+          status: 'locked',
+          amount: escrow.amountEach,
+          operationId: walletOperationId(
+            'stake',
+            escrow.matchId,
+            playerId
+          ),
+          lockedAt:
+            num(locks[playerId]?.lockedAt) ||
+            now()
+        };
+      }
+    });
+
+    const funded = escrow.participants.length === 2 &&
+      escrow.participants.every(
+        playerId => locks[playerId]?.status === 'locked'
+      );
+
+    return {
+      ...escrow,
+      locks,
+      status: funded ? 'funded' : 'locking',
+      fundedAt:
+        funded
+          ? escrow.fundedAt || now()
+          : 0,
+      updatedAt: now()
+    };
+  });
+}
+
+async function updateRankedMatchEconomy(matchId, economy) {
+  const key = rankedMatchKey(matchId);
+
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const row = await kvGet(key);
+    if (!row) throw new Error('ranked_match_not_found');
+
+    const match = payload(row);
+    const next = {
+      ...match,
+      economy,
+      updatedAt: now()
+    };
+
+    if (await kvCompareAndPut({
+      row,
+      type: 'rankedMatch',
+      owner: match.roomId,
+      expiresAt: num(row.expires_at),
+      data: next
+    })) {
+      return next;
+    }
+  }
+
+  throw new Error('ranked_match_economy_conflict');
+}
+
+async function markEscrowOperation({
+  matchId,
+  playerId,
+  operationId,
+  status
+}) {
+  return updateRankedEscrow(matchId, escrow => ({
+    ...escrow,
+    operations: {
+      ...(escrow.operations || {}),
+      [playerId]: {
+        operationId,
+        status,
+        at: now()
+      }
+    },
+    updatedAt: now()
+  }));
+}
+
+async function reconcileRankedEconomy(match) {
+  if (match.economy?.required !== true) return match;
+
+  let escrow = await reconcileEscrowFunding(match);
+
+  if (!isRankedTerminal(match.status)) {
+    return updateRankedMatchEconomy(
+      match.matchId,
+      publicRankedEscrow(escrow)
+    );
+  }
+
+  const payoutTerminal = [
+    'settled',
+    'forfeited'
+  ].includes(match.status);
+
+  const refundTerminal = [
+    'aborted',
+    'disputed',
+    'refunded'
+  ].includes(match.status);
+
+  if (!payoutTerminal && !refundTerminal) return match;
+
+  if (payoutTerminal) {
+    const winnerId = sanitizeId(
+      match.settlement?.winnerId,
+      96
+    );
+    const loserId = sanitizeId(
+      match.settlement?.loserId,
+      96
+    );
+
+    if (!winnerId || !loserId) {
+      throw new Error('ranked_escrow_settlement_missing');
+    }
+
+    escrow = await updateRankedEscrow(
+      match.matchId,
+      current => ({
+        ...current,
+        status: current.status === 'paid'
+          ? 'paid'
+          : 'paying',
+        winnerId,
+        loserId,
+        updatedAt: now()
+      })
+    );
+
+    if (escrow.status !== 'paid') {
+      for (const playerId of [winnerId, loserId]) {
+        const result = await applyWalletEscrowOperation({
+          playerId,
+          matchId: match.matchId,
+          kind: 'payout',
+          amount: escrow.amountEach,
+          won: playerId === winnerId
+        });
+
+        escrow = await markEscrowOperation({
+          matchId: match.matchId,
+          playerId,
+          operationId: result.operationId,
+          status: 'paid'
+        });
+      }
+
+      escrow = await updateRankedEscrow(
+        match.matchId,
+        current => ({
+          ...current,
+          status: 'paid',
+          paidAt: current.paidAt || now(),
+          updatedAt: now()
+        })
+      );
+    }
+  }
+
+  if (refundTerminal) {
+    escrow = await updateRankedEscrow(
+      match.matchId,
+      current => ({
+        ...current,
+        status: current.status === 'refunded'
+          ? 'refunded'
+          : 'refunding',
+        updatedAt: now()
+      })
+    );
+
+    if (escrow.status !== 'refunded') {
+      for (const playerId of escrow.participants) {
+        const result = await applyWalletEscrowOperation({
+          playerId,
+          matchId: match.matchId,
+          kind: 'refund',
+          amount: escrow.amountEach
+        });
+
+        escrow = await markEscrowOperation({
+          matchId: match.matchId,
+          playerId,
+          operationId: result.operationId,
+          status: 'refunded'
+        });
+      }
+
+      escrow = await updateRankedEscrow(
+        match.matchId,
+        current => ({
+          ...current,
+          status: 'refunded',
+          refundedAt: current.refundedAt || now(),
+          updatedAt: now()
+        })
+      );
+    }
+  }
+
+  return updateRankedMatchEconomy(
+    match.matchId,
+    publicRankedEscrow(escrow)
+  );
+}
+
+async function actionRankedStakePrepare(event, body) {
+  const {
+    playerId,
+    matchId,
+    match
+  } = await requireRankedMatchPlayer(event, body);
+
+  if (isRankedTerminal(match.status)) {
+    const current = await reconcileRankedEconomy(match);
+
+    return {
+      ok: true,
+      duplicate: true,
+      match: publicRankedMatch(current, playerId)
+    };
+  }
+
+  if (match.status !== 'pending') {
+    throw rankedRpsError('ranked_stake_match_not_pending');
+  }
+
+  if (sanitizeId(match.rps?.firstPlayerId, 96)) {
+    throw rankedRpsError('ranked_stake_after_rps_forbidden');
+  }
+
+  const escrow = await getOrCreateRankedEscrow(match);
+
+  const operation = await applyWalletEscrowOperation({
+    playerId,
+    matchId,
+    kind: 'stake',
+    amount: escrow.escrow.amountEach
+  });
+
+  await markEscrowOperation({
+    matchId,
+    playerId,
+    operationId: operation.operationId,
+    status: 'locked'
+  });
+
+  const funded = await reconcileEscrowFunding(match);
+  const current = await updateRankedMatchEconomy(
+    matchId,
+    publicRankedEscrow(funded)
+  );
+
+  return {
+    ok: true,
+    duplicate: operation.duplicate,
+    playerId,
+    operationId: operation.operationId,
+    wallet: publicShardWallet(operation.wallet),
+    escrow: publicRankedEscrow(funded),
+    match: publicRankedMatch(current, playerId)
+  };
 }
 
 const RANKED_GAME_ID = 'war_hearts';
@@ -3669,6 +4346,14 @@ async function actionRankedRpsCommit(event, body) {
       );
     }
 
+    const escrow = await reconcileEscrowFunding(match);
+
+    if (escrow.status !== 'funded') {
+      throw rankedRpsError(
+        'ranked_escrow_not_funded'
+      );
+    }
+
     const rps = normalizeRankedRps(match.rps);
 
     if (rps.firstPlayerId) {
@@ -3826,6 +4511,14 @@ async function actionRankedRpsReveal(event, body) {
     if (match.status !== 'pending') {
       throw rankedRpsError(
         'ranked_rps_match_not_pending'
+      );
+    }
+
+    const escrow = await reconcileEscrowFunding(match);
+
+    if (escrow.status !== 'funded') {
+      throw rankedRpsError(
+        'ranked_escrow_not_funded'
       );
     }
 
@@ -4605,7 +5298,7 @@ async function settleRankedMatch(matchId) {
     const match = payload(row);
 
     if (isRankedTerminal(match.status)) {
-      return match;
+      return reconcileRankedEconomy(match);
     }
 
     if (match.status === 'pending') {
@@ -4638,7 +5331,7 @@ async function settleRankedMatch(matchId) {
           expiresAt: num(row.expires_at),
           data: disputed
         })) {
-          return disputed;
+          return reconcileRankedEconomy(disputed);
         }
 
         continue;
@@ -4812,7 +5505,7 @@ async function settleRankedMatch(matchId) {
       expiresAt: num(row.expires_at),
       data: completed
     })) {
-      return completed;
+      return reconcileRankedEconomy(completed);
     }
   }
 
@@ -4834,7 +5527,7 @@ async function reconcileRankedMatch(matchId) {
     ) {
       return match.status === 'settling'
         ? settleRankedMatch(matchId)
-        : match;
+        : reconcileRankedEconomy(match);
     }
 
     if (match.status === 'forfeit_pending') {
@@ -4885,7 +5578,7 @@ async function reconcileRankedMatch(matchId) {
           expiresAt: num(row.expires_at),
           data: disputed
         })) {
-          return disputed;
+          return reconcileRankedEconomy(disputed);
         }
 
         continue;
@@ -4917,7 +5610,7 @@ async function reconcileRankedMatch(matchId) {
         expiresAt: num(row.expires_at),
         data: aborted
       })) {
-        return aborted;
+        return reconcileRankedEconomy(aborted);
       }
 
       continue;
@@ -5071,6 +5764,18 @@ async function actionRankedMatchPrepare(event, body) {
           updatedAt: preparedAt
         },
         submissions: {},
+        economy: {
+          required: true,
+          status: 'locking',
+          stakeEach: RANKED_STAKE_AMOUNT,
+          escrow: RANKED_STAKE_AMOUNT * 2,
+          lockedPlayers: 0,
+          participants: 2,
+          fundedAt: 0,
+          paidAt: 0,
+          refundedAt: 0,
+          updatedAt: preparedAt
+        },
         createdAt: preparedAt,
         updatedAt: preparedAt
       }
@@ -5092,6 +5797,8 @@ async function actionRankedMatchPrepare(event, body) {
   if (!matchRow) {
     throw new Error('ranked_match_not_ready');
   }
+
+  await getOrCreateRankedEscrow(match);
 
   return {
     ok: true,
@@ -5303,14 +6010,26 @@ async function actionRankedMatchCleanup(event, body) {
   for (const row of rows) {
     const match = payload(row);
 
-    if (!match.matchId || isRankedTerminal(match.status)) {
+    const economyDone = [
+      'paid',
+      'refunded',
+      'not_required'
+    ].includes(match.economy?.status);
+
+    if (
+      !match.matchId ||
+      (
+        isRankedTerminal(match.status) &&
+        economyDone
+      )
+    ) {
       continue;
     }
 
     try {
-      const current = await reconcileRankedMatch(
-        match.matchId
-      );
+      const current = isRankedTerminal(match.status)
+        ? await reconcileRankedEconomy(match)
+        : await reconcileRankedMatch(match.matchId);
 
       if (current.status !== match.status) {
         results.push({
@@ -5677,6 +6396,7 @@ const ACTIONS = {
   signal_send: actionSignalSend,
   signal_poll: actionSignalPoll,
   ranked_match_prepare: actionRankedMatchPrepare,
+  ranked_stake_prepare: actionRankedStakePrepare,
   ranked_rps_commit: actionRankedRpsCommit,
   ranked_rps_reveal: actionRankedRpsReveal,
   ranked_match_submit: actionRankedMatchSubmit,
