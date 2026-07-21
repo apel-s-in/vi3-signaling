@@ -46,6 +46,29 @@ const CFG = {
     )
   ),
   chatE2eeV2: safe(process.env.CHAT_E2EE_V2 || '0') === '1',
+  listeningReceiptsShadow:
+    safe(process.env.LISTENING_RECEIPTS_SHADOW || '1') === '1',
+  listenHeartbeatMinMs: Math.max(
+    5000,
+    Math.min(
+      num(process.env.LISTEN_HEARTBEAT_MIN_MS, 8000),
+      30000
+    )
+  ),
+  listenHeartbeatMaxGapMs: Math.max(
+    30000,
+    Math.min(
+      num(process.env.LISTEN_HEARTBEAT_MAX_GAP_MS, 90000),
+      180000
+    )
+  ),
+  listenSessionMaxMs: Math.max(
+    10 * 60 * 1000,
+    Math.min(
+      num(process.env.LISTEN_SESSION_MAX_MS, 8 * 60 * 60 * 1000),
+      24 * 60 * 60 * 1000
+    )
+  ),
   turnSharedSecret: safe(process.env.TURN_SHARED_SECRET || ''),
   turnCredentialTtlSec: Math.max(
     300,
@@ -268,6 +291,57 @@ function reply(event, statusCode, body) {
 function sanitizeId(v, max = 96) {
   return safe(v).replace(/[^A-Za-z0-9._:-]/g, '').slice(0, max);
 }
+
+function parseListenTrackCatalog(raw) {
+  let parsed;
+
+  try {
+    parsed = JSON.parse(String(raw || '[]'));
+  } catch {
+    parsed = [];
+  }
+
+  const rows = Array.isArray(parsed)
+    ? parsed
+    : Object.entries(
+        parsed && typeof parsed === 'object'
+          ? parsed
+          : {}
+      ).map(([uid, value]) => ({
+        uid,
+        ...(value && typeof value === 'object'
+          ? value
+          : { duration: value })
+      }));
+
+  return new Map(
+    rows
+      .map(item => {
+        const uid = sanitizeId(item?.uid, 160);
+        const duration = Math.max(
+          10,
+          Math.min(7200, num(item?.duration))
+        );
+        const album = sanitizeId(item?.album, 120);
+
+        return uid && duration >= 10
+          ? [
+              uid,
+              Object.freeze({
+                uid,
+                duration,
+                album
+              })
+            ]
+          : null;
+      })
+      .filter(Boolean)
+  );
+}
+
+const LISTEN_TRACK_CATALOG = parseListenTrackCatalog(
+  process.env.LISTEN_TRACK_CATALOG_JSON
+);
 
 function payload(row) {
   try {
@@ -3262,7 +3336,833 @@ async function actionVoiceCallEnd(event, body) {
 
   return { ok: true, ended: true };
 }
+const LISTEN_RECEIPT_VERSION = 1;
+const LISTEN_SESSION_RETENTION_MS =
+  90 * 24 * 60 * 60 * 1000;
+const LISTEN_PROGRESS_RECEIPT_LIMIT = 5000;
 
+function listenActiveKey(playerId) {
+  return `listenActive:${sanitizeId(playerId, 96)}`;
+}
+
+function listenSessionKey(playerId, sessionId) {
+  return [
+    'listen',
+    sanitizeId(playerId, 96),
+    sanitizeId(sessionId, 120)
+  ].join(':');
+}
+
+function listenReceiptKey(playerId, receiptId) {
+  return [
+    'listenReceipt',
+    sanitizeId(playerId, 96),
+    sanitizeId(receiptId, 120)
+  ].join(':');
+}
+
+function achievementProgressKey(playerId) {
+  return `achievementProgress:${sanitizeId(playerId, 96)}`;
+}
+
+function listenTrackFromCatalog(trackUid) {
+  const uid = sanitizeId(trackUid, 160);
+  const track = LISTEN_TRACK_CATALOG.get(uid);
+
+  if (!track) {
+    const error = new Error('listen_track_not_catalogued');
+    error.httpStatus = 409;
+    throw error;
+  }
+
+  return track;
+}
+
+function normalizeListenSession(raw = {}) {
+  return {
+    version: LISTEN_RECEIPT_VERSION,
+    playerId: sanitizeId(raw.playerId, 96),
+    sessionId: sanitizeId(raw.sessionId, 120),
+    deviceId: sanitizeId(raw.deviceId, 120),
+    trackUid: sanitizeId(raw.trackUid, 160),
+    album: sanitizeId(raw.album, 120),
+    duration: Math.max(
+      0,
+      Math.min(7200, num(raw.duration))
+    ),
+    variant: sanitizeId(raw.variant || 'audio', 40),
+    quality: sanitizeId(raw.quality || '', 20),
+    status: sanitizeId(raw.status || 'active', 30),
+    startedAt: num(raw.startedAt),
+    lastHeartbeatAt: num(raw.lastHeartbeatAt),
+    completedAt: num(raw.completedAt),
+    lastPosition: Math.max(0, num(raw.lastPosition)),
+    observedMs: Math.max(0, num(raw.observedMs)),
+    acceptedHeartbeats: Math.max(
+      0,
+      Math.floor(num(raw.acceptedHeartbeats))
+    ),
+    rejectedHeartbeats: Math.max(
+      0,
+      Math.floor(num(raw.rejectedHeartbeats))
+    ),
+    lastRejectReason: sanitizeId(
+      raw.lastRejectReason,
+      80
+    ),
+    completionReason: sanitizeId(
+      raw.completionReason,
+      40
+    ),
+    receiptId: sanitizeId(raw.receiptId, 120),
+    visibility: sanitizeId(raw.visibility, 20),
+    platform: sanitizeId(raw.platform, 30),
+    updatedAt: num(raw.updatedAt)
+  };
+}
+
+function normalizeAchievementProgress(raw = {}, playerId = '') {
+  const uniqueTracks =
+    raw.uniqueTracks && typeof raw.uniqueTracks === 'object'
+      ? raw.uniqueTracks
+      : {};
+
+  const perTrackFull =
+    raw.perTrackFull && typeof raw.perTrackFull === 'object'
+      ? raw.perTrackFull
+      : {};
+
+  return {
+    version: 1,
+    playerId: sanitizeId(
+      playerId || raw.playerId,
+      96
+    ),
+    shadow: true,
+    validPlays: Math.max(
+      0,
+      Math.floor(num(raw.validPlays))
+    ),
+    fullPlays: Math.max(
+      0,
+      Math.floor(num(raw.fullPlays))
+    ),
+    totalSec: Math.max(
+      0,
+      Math.floor(num(raw.totalSec))
+    ),
+    uniqueTracks: Object.fromEntries(
+      Object.entries(uniqueTracks)
+        .map(([uid, at]) => [
+          sanitizeId(uid, 160),
+          num(at)
+        ])
+        .filter(([uid, at]) => uid && at > 0)
+    ),
+    perTrackFull: Object.fromEntries(
+      Object.entries(perTrackFull)
+        .map(([uid, count]) => [
+          sanitizeId(uid, 160),
+          Math.max(0, Math.floor(num(count)))
+        ])
+        .filter(([uid, count]) => uid && count > 0)
+    ),
+    activeDays: [...new Set(
+      (Array.isArray(raw.activeDays)
+        ? raw.activeDays
+        : [])
+        .map(value => sanitizeId(value, 20))
+        .filter(value => /^\d{4}-\d{2}-\d{2}$/.test(value))
+    )].sort().slice(-400),
+    receiptIds: [...new Set(
+      (Array.isArray(raw.receiptIds)
+        ? raw.receiptIds
+        : [])
+        .map(value => sanitizeId(value, 120))
+        .filter(Boolean)
+    )].slice(-LISTEN_PROGRESS_RECEIPT_LIMIT),
+    updatedAt: num(raw.updatedAt)
+  };
+}
+
+function utcDayKey(timestamp) {
+  return new Date(num(timestamp) || now())
+    .toISOString()
+    .slice(0, 10);
+}
+
+function calculateServerStreak(days = []) {
+  const values = [...new Set(days)]
+    .filter(value => /^\d{4}-\d{2}-\d{2}$/.test(value))
+    .sort();
+
+  if (!values.length) return 0;
+
+  let streak = 1;
+
+  for (let index = values.length - 1; index > 0; index--) {
+    const current = Date.parse(`${values[index]}T00:00:00Z`);
+    const previous = Date.parse(
+      `${values[index - 1]}T00:00:00Z`
+    );
+
+    if (current - previous !== 86400000) break;
+    streak++;
+  }
+
+  return streak;
+}
+
+function publicListenSession(session) {
+  const data = normalizeListenSession(session);
+
+  return {
+    version: data.version,
+    sessionId: data.sessionId,
+    trackUid: data.trackUid,
+    status: data.status,
+    startedAt: data.startedAt,
+    lastHeartbeatAt: data.lastHeartbeatAt,
+    completedAt: data.completedAt,
+    observedSec: Math.floor(data.observedMs / 1000),
+    acceptedHeartbeats: data.acceptedHeartbeats,
+    rejectedHeartbeats: data.rejectedHeartbeats,
+    lastRejectReason: data.lastRejectReason,
+    receiptId: data.receiptId
+  };
+}
+
+function publicAchievementProgress(progress) {
+  const data = normalizeAchievementProgress(
+    progress,
+    progress?.playerId
+  );
+
+  return {
+    version: data.version,
+    shadow: true,
+    rewardsEnabled: false,
+    validPlays: data.validPlays,
+    fullPlays: data.fullPlays,
+    totalSec: data.totalSec,
+    uniqueTracks: Object.keys(data.uniqueTracks).length,
+    maxOneTrackFull: Math.max(
+      0,
+      ...Object.values(data.perTrackFull)
+    ),
+    streak: calculateServerStreak(data.activeDays),
+    activeDays: data.activeDays.length,
+    receipts: data.receiptIds.length,
+    updatedAt: data.updatedAt
+  };
+}
+
+async function persistListenSession(session) {
+  const data = normalizeListenSession(session);
+
+  await kvPut({
+    pk: listenSessionKey(
+      data.playerId,
+      data.sessionId
+    ),
+    type: 'listenSession',
+    owner: data.playerId,
+    expiresAt: now() + LISTEN_SESSION_RETENTION_MS,
+    data
+  });
+
+  return data;
+}
+
+function applyListenObservation(
+  session,
+  body,
+  {
+    completed = false,
+    at = now()
+  } = {}
+) {
+  const current = normalizeListenSession(session);
+  const rawPosition = Number(body.position);
+
+  if (!Number.isFinite(rawPosition) || rawPosition < 0) {
+    throw new Error('listen_position_invalid');
+  }
+
+  const position = Math.min(
+    current.duration,
+    rawPosition
+  );
+  const gapMs = Math.max(
+    0,
+    at - current.lastHeartbeatAt
+  );
+  const gapSec = gapMs / 1000;
+  const positionDelta =
+    position - current.lastPosition;
+
+  if (
+    !completed &&
+    gapMs < CFG.listenHeartbeatMinMs
+  ) {
+    return {
+      changed: false,
+      throttled: true,
+      session: current
+    };
+  }
+
+  let accepted = true;
+  let rejectReason = '';
+
+  if (gapMs <= 0) {
+    accepted = false;
+    rejectReason = 'clock';
+  } else if (gapMs > CFG.listenHeartbeatMaxGapMs) {
+    accepted = false;
+    rejectReason = 'heartbeat_gap';
+  } else if (positionDelta < -2) {
+    accepted = false;
+    rejectReason = 'position_rewind';
+  } else if (positionDelta > gapSec + 5) {
+    accepted = false;
+    rejectReason = 'position_jump';
+  }
+
+  const creditMs = accepted
+    ? Math.max(
+        0,
+        Math.min(
+          gapMs,
+          Math.max(0, positionDelta * 1000 + 1500),
+          CFG.listenHeartbeatMaxGapMs
+        )
+      )
+    : 0;
+
+  return {
+    changed: true,
+    throttled: false,
+    accepted,
+    creditMs,
+    session: {
+      ...current,
+      lastHeartbeatAt: at,
+      lastPosition: position,
+      observedMs: current.observedMs + creditMs,
+      acceptedHeartbeats:
+        current.acceptedHeartbeats +
+        (accepted ? 1 : 0),
+      rejectedHeartbeats:
+        current.rejectedHeartbeats +
+        (accepted ? 0 : 1),
+      lastRejectReason: accepted
+        ? ''
+        : rejectReason,
+      visibility: sanitizeId(
+        body.visibility,
+        20
+      ),
+      platform: sanitizeId(
+        body.platform,
+        30
+      ),
+      updatedAt: at
+    }
+  };
+}
+
+async function applyListenReceiptProgress(receipt) {
+  const key = achievementProgressKey(receipt.playerId);
+
+  for (let attempt = 0; attempt < 10; attempt++) {
+    let row = await kvGet(key);
+
+    if (!row) {
+      try {
+        await kvInsert({
+          pk: key,
+          type: 'achievementProgress',
+          owner: receipt.playerId,
+          data: normalizeAchievementProgress(
+            {},
+            receipt.playerId
+          )
+        });
+      } catch {}
+
+      row = await kvGet(key);
+      if (!row) continue;
+    }
+
+    const progress = normalizeAchievementProgress(
+      payload(row),
+      receipt.playerId
+    );
+
+    if (progress.receiptIds.includes(receipt.receiptId)) {
+      return {
+        duplicate: true,
+        progress
+      };
+    }
+
+    const uniqueTracks = {
+      ...progress.uniqueTracks
+    };
+    const perTrackFull = {
+      ...progress.perTrackFull
+    };
+    const activeDays = [...progress.activeDays];
+
+    if (receipt.valid) {
+      uniqueTracks[receipt.trackUid] =
+        uniqueTracks[receipt.trackUid] ||
+        receipt.completedAt;
+
+      const day = utcDayKey(receipt.completedAt);
+      if (!activeDays.includes(day)) activeDays.push(day);
+    }
+
+    if (receipt.full) {
+      perTrackFull[receipt.trackUid] =
+        Math.max(
+          0,
+          Math.floor(num(perTrackFull[receipt.trackUid]))
+        ) + 1;
+    }
+
+    const next = normalizeAchievementProgress({
+      ...progress,
+      validPlays:
+        progress.validPlays +
+        (receipt.valid ? 1 : 0),
+      fullPlays:
+        progress.fullPlays +
+        (receipt.full ? 1 : 0),
+      totalSec:
+        progress.totalSec +
+        (receipt.valid ? receipt.observedSec : 0),
+      uniqueTracks,
+      perTrackFull,
+      activeDays,
+      receiptIds: [
+        ...progress.receiptIds,
+        receipt.receiptId
+      ],
+      updatedAt: now()
+    }, receipt.playerId);
+
+    if (!await kvCompareAndPut({
+      row,
+      type: 'achievementProgress',
+      owner: receipt.playerId,
+      data: next
+    })) {
+      continue;
+    }
+
+    return {
+      duplicate: false,
+      progress: next
+    };
+  }
+
+  throw new Error('achievement_progress_conflict');
+}
+
+async function finalizeListenSession(session) {
+  const data = normalizeListenSession(session);
+  const receiptId =
+    data.receiptId ||
+    `lr_${hash([
+      data.playerId,
+      data.sessionId,
+      data.completedAt
+    ].join(':')).slice(0, 28)}`;
+
+  const observedSec = Math.max(
+    0,
+    Math.floor(data.observedMs / 1000)
+  );
+  const progressRatio = data.duration > 0
+    ? data.lastPosition / data.duration
+    : 0;
+  const valid = observedSec >= 13;
+  const full =
+    data.completionReason === 'ended' &&
+    progressRatio >= 0.9 &&
+    observedSec >= Math.max(
+      13,
+      Math.floor(data.duration * 0.8)
+    );
+
+  const receipt = {
+    version: LISTEN_RECEIPT_VERSION,
+    receiptId,
+    playerId: data.playerId,
+    sessionId: data.sessionId,
+    trackUid: data.trackUid,
+    album: data.album,
+    duration: data.duration,
+    observedSec,
+    finalPosition: data.lastPosition,
+    progressRatio: Math.max(
+      0,
+      Math.min(1, progressRatio)
+    ),
+    valid,
+    full,
+    acceptedHeartbeats: data.acceptedHeartbeats,
+    rejectedHeartbeats: data.rejectedHeartbeats,
+    completionReason: data.completionReason,
+    startedAt: data.startedAt,
+    completedAt: data.completedAt,
+    shadow: true,
+    rewardGranted: false
+  };
+
+  await kvPut({
+    pk: listenReceiptKey(data.playerId, receiptId),
+    type: 'listenReceipt',
+    owner: data.playerId,
+    expiresAt: now() + LISTEN_SESSION_RETENTION_MS,
+    data: receipt
+  });
+
+  const applied = await applyListenReceiptProgress(receipt);
+
+  return {
+    receipt,
+    progress: applied.progress,
+    duplicate: applied.duplicate
+  };
+}
+
+async function actionListenSessionStart(event, body) {
+  const { playerId } = await requirePlayer(event, body);
+
+  await enforceRateLimit({
+    scope: 'listen_start',
+    actor: playerId,
+    limit: 40,
+    windowMs: 60 * 1000
+  });
+
+  const track = listenTrackFromCatalog(body.trackUid);
+  const deviceId =
+    sanitizeId(body.deviceId, 120) ||
+    'web';
+  const key = listenActiveKey(playerId);
+
+  for (let attempt = 0; attempt < 10; attempt++) {
+    let row = await kvGet(key);
+    const current = normalizeListenSession(payload(row));
+
+    if (
+      row &&
+      current.status === 'active' &&
+      current.trackUid === track.uid &&
+      current.deviceId === deviceId &&
+      now() - current.lastHeartbeatAt <
+        CFG.listenHeartbeatMaxGapMs
+    ) {
+      return {
+        ok: true,
+        duplicate: true,
+        shadow: true,
+        session: publicListenSession(current)
+      };
+    }
+
+    const at = now();
+    const session = normalizeListenSession({
+      version: LISTEN_RECEIPT_VERSION,
+      playerId,
+      sessionId: rid('listen'),
+      deviceId,
+      trackUid: track.uid,
+      album: track.album,
+      duration: track.duration,
+      variant: body.variant || 'audio',
+      quality: body.quality || '',
+      status: 'active',
+      startedAt: at,
+      lastHeartbeatAt: at,
+      lastPosition: Math.max(
+        0,
+        Math.min(
+          track.duration,
+          num(body.position)
+        )
+      ),
+      observedMs: 0,
+      acceptedHeartbeats: 0,
+      rejectedHeartbeats: 0,
+      visibility: sanitizeId(
+        body.visibility,
+        20
+      ),
+      platform: sanitizeId(
+        body.platform,
+        30
+      ),
+      updatedAt: at
+    });
+
+    if (!row) {
+      try {
+        await kvInsert({
+          pk: key,
+          type: 'listenActive',
+          owner: playerId,
+          data: session
+        });
+
+        await persistListenSession(session);
+
+        return {
+          ok: true,
+          duplicate: false,
+          shadow: true,
+          session: publicListenSession(session)
+        };
+      } catch {
+        continue;
+      }
+    }
+
+    if (current.status === 'active') {
+      await persistListenSession({
+        ...current,
+        status: 'replaced',
+        completedAt: at,
+        completionReason: 'replaced',
+        updatedAt: at
+      }).catch(() => null);
+    }
+
+    if (!await kvCompareAndPut({
+      row,
+      type: 'listenActive',
+      owner: playerId,
+      data: session
+    })) {
+      continue;
+    }
+
+    await persistListenSession(session);
+
+    return {
+      ok: true,
+      duplicate: false,
+      shadow: true,
+      session: publicListenSession(session)
+    };
+  }
+
+  throw new Error('listen_session_start_conflict');
+}
+
+async function actionListenSessionHeartbeat(event, body) {
+  const { playerId } = await requirePlayer(event, body);
+  const sessionId = sanitizeId(body.sessionId, 120);
+
+  if (!sessionId) {
+    throw new Error('listen_session_required');
+  }
+
+  const key = listenActiveKey(playerId);
+
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const row = await kvGet(key);
+    const session = normalizeListenSession(payload(row));
+
+    if (
+      !row ||
+      session.sessionId !== sessionId ||
+      session.status !== 'active'
+    ) {
+      throw new Error('listen_session_not_active');
+    }
+
+    if (
+      now() - session.startedAt >
+      CFG.listenSessionMaxMs
+    ) {
+      throw new Error('listen_session_expired');
+    }
+
+    const observation = applyListenObservation(
+      session,
+      body
+    );
+
+    if (observation.throttled) {
+      return {
+        ok: true,
+        throttled: true,
+        accepted: false,
+        shadow: true,
+        session: publicListenSession(session)
+      };
+    }
+
+    if (!await kvCompareAndPut({
+      row,
+      type: 'listenActive',
+      owner: playerId,
+      data: observation.session
+    })) {
+      continue;
+    }
+
+    await persistListenSession(
+      observation.session
+    ).catch(() => null);
+
+    return {
+      ok: true,
+      throttled: false,
+      accepted: observation.accepted,
+      creditedMs: observation.creditMs,
+      shadow: true,
+      session: publicListenSession(
+        observation.session
+      )
+    };
+  }
+
+  throw new Error('listen_heartbeat_conflict');
+}
+
+async function actionListenSessionComplete(event, body) {
+  const { playerId } = await requirePlayer(event, body);
+  const sessionId = sanitizeId(body.sessionId, 120);
+
+  if (!sessionId) {
+    throw new Error('listen_session_required');
+  }
+
+  const key = listenActiveKey(playerId);
+
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const row = await kvGet(key);
+    const current = normalizeListenSession(payload(row));
+
+    if (!row || current.sessionId !== sessionId) {
+      throw new Error('listen_session_not_active');
+    }
+
+    if (current.status === 'completed') {
+      const finalized = await finalizeListenSession(current);
+
+      return {
+        ok: true,
+        duplicate: true,
+        shadow: true,
+        receipt: finalized.receipt,
+        progress: publicAchievementProgress(
+          finalized.progress
+        )
+      };
+    }
+
+    if (current.status !== 'active') {
+      throw new Error('listen_session_not_active');
+    }
+
+    const at = now();
+    const observation = applyListenObservation(
+      current,
+      body,
+      {
+        completed: true,
+        at
+      }
+    );
+
+    const receiptId = `lr_${hash([
+      playerId,
+      sessionId,
+      at
+    ].join(':')).slice(0, 28)}`;
+
+    const completed = normalizeListenSession({
+      ...observation.session,
+      status: 'completed',
+      completedAt: at,
+      completionReason: sanitizeId(
+        body.reason || 'unknown',
+        40
+      ),
+      receiptId,
+      updatedAt: at
+    });
+
+    if (!await kvCompareAndPut({
+      row,
+      type: 'listenActive',
+      owner: playerId,
+      data: completed
+    })) {
+      continue;
+    }
+
+    await persistListenSession(completed);
+    const finalized = await finalizeListenSession(completed);
+
+    return {
+      ok: true,
+      duplicate: false,
+      acceptedFinalObservation:
+        observation.accepted === true,
+      shadow: true,
+      receipt: finalized.receipt,
+      progress: publicAchievementProgress(
+        finalized.progress
+      )
+    };
+  }
+
+  throw new Error('listen_session_complete_conflict');
+}
+
+async function actionAchievementRewardStatus(event, body) {
+  const { playerId } = await requirePlayer(event, body);
+  const active = normalizeListenSession(
+    payload(await kvGet(listenActiveKey(playerId)))
+  );
+  const progress = normalizeAchievementProgress(
+    payload(await kvGet(
+      achievementProgressKey(playerId)
+    )),
+    playerId
+  );
+
+  return {
+    ok: true,
+    shadow: true,
+    rewardsEnabled: false,
+    conversion: {
+      xpToShards: 1,
+      rule: '1_xp_equals_1_shard'
+    },
+    catalog: {
+      configured: LISTEN_TRACK_CATALOG.size > 0,
+      tracks: LISTEN_TRACK_CATALOG.size
+    },
+    activeSession:
+      active.playerId === playerId &&
+      active.status === 'active'
+        ? publicListenSession(active)
+        : null,
+    progress: publicAchievementProgress(progress)
+  };
+}
+
+const SHARD_WALLET_VERSION = 1;
+const REGISTRATION_SHARD_REWARD = 100;
 const SHARD_WALLET_VERSION = 1;
 const REGISTRATION_SHARD_REWARD = 100;
 const WALLET_GRANT_HISTORY = 300;
@@ -6635,6 +7535,11 @@ const ACTIONS = {
   wallet_registration_backfill:
     actionWalletRegistrationBackfill,
   wallet_purchase_avatar: actionWalletPurchaseAvatar,
+  listen_session_start: actionListenSessionStart,
+  listen_session_heartbeat: actionListenSessionHeartbeat,
+  listen_session_complete: actionListenSessionComplete,
+  achievement_reward_status:
+    actionAchievementRewardStatus,
   rtc_config: actionRtcConfig,
   webpush_config: actionWebPushConfig,
   webpush_subscribe: actionWebPushSubscribe,
@@ -6701,6 +7606,14 @@ exports.handler = async event => {
         chatE2eeV2: CFG.chatE2eeV2,
         chatMode: 'e2ee-v2-only',
         temporaryTurnConfigured: !!CFG.turnSharedSecret,
+        listeningReceipts: {
+          enabled: true,
+          shadow: CFG.listeningReceiptsShadow,
+          catalogConfigured:
+            LISTEN_TRACK_CATALOG.size > 0,
+          catalogTracks:
+            LISTEN_TRACK_CATALOG.size
+        },
         ts: now()
       });
     }
