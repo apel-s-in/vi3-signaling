@@ -3377,6 +3377,75 @@ const RANKED_BOARD_SIZE = 10;
 const RANKED_FLEET = [4, 3, 3, 2, 2, 2, 1, 1, 1, 1];
 const RANKED_MAX_TRANSCRIPT = 200;
 const RANKED_SETTLEMENT_HISTORY = 100;
+const RANKED_FORFEIT_GRACE_MS = 2 * 60 * 1000;
+const RANKED_SUBMISSION_TIMEOUT_MS = 5 * 60 * 1000;
+const RANKED_ABANDONED_TIMEOUT_MS = 6 * 60 * 60 * 1000;
+
+const RANKED_TERMINAL_STATUSES = new Set([
+  'settled',
+  'forfeited',
+  'disputed',
+  'aborted',
+  'refunded'
+]);
+
+const RANKED_TRANSITIONS = Object.freeze({
+  pending: new Set([
+    'forfeit_pending',
+    'settling',
+    'disputed',
+    'aborted'
+  ]),
+  forfeit_pending: new Set([
+    'settling',
+    'disputed',
+    'aborted'
+  ]),
+  settling: new Set([
+    'settled',
+    'forfeited',
+    'disputed',
+    'refunded'
+  ]),
+  disputed: new Set([
+    'refunded'
+  ])
+});
+
+function isRankedTerminal(status) {
+  return RANKED_TERMINAL_STATUSES.has(safe(status));
+}
+
+function transitionRankedMatch(match, nextStatus, {
+  reason = '',
+  actorId = '',
+  extra = {}
+} = {}) {
+  const current = safe(match?.status || 'pending');
+  const next = safe(nextStatus);
+
+  if (current === next) return match;
+
+  if (!RANKED_TRANSITIONS[current]?.has(next)) {
+    throw new Error(
+      `ranked_transition_forbidden:${current}:${next}`
+    );
+  }
+
+  const at = now();
+
+  return {
+    ...match,
+    ...extra,
+    status: next,
+    terminalReason: safe(reason).slice(0, 120),
+    terminalActorId: sanitizeId(actorId, 96),
+    updatedAt: at,
+    ...(isRankedTerminal(next)
+      ? { terminalAt: at }
+      : {})
+  };
+}
 
 function rankedMatchKey(matchId) {
   return `rankedMatch:${sanitizeId(matchId, 120)}`;
@@ -3820,6 +3889,66 @@ function validateRankedSubmissions(match) {
   return transcriptCheck;
 }
 
+async function buildRankedSettlementPlan({
+  match,
+  winnerId,
+  loserId,
+  outcome = 'completed',
+  turns = 0
+}) {
+  if (
+    !match?.participants?.includes(winnerId) ||
+    !match?.participants?.includes(loserId) ||
+    winnerId === loserId
+  ) {
+    throw new Error('ranked_settlement_players_invalid');
+  }
+
+  const [winnerProfile, loserProfile] = await Promise.all([
+    kvGet(`profile:${winnerId}`),
+    kvGet(`profile:${loserId}`)
+  ]);
+
+  if (!winnerProfile || !loserProfile) {
+    throw new Error('ranked_profile_not_found');
+  }
+
+  const winnerRating = Math.max(
+    100,
+    num(payload(winnerProfile).rating, 1000)
+  );
+  const loserRating = Math.max(
+    100,
+    num(payload(loserProfile).rating, 1000)
+  );
+
+  const expected = 1 / (
+    1 + Math.pow(10, (loserRating - winnerRating) / 400)
+  );
+
+  const winnerDelta = Math.max(
+    1,
+    Math.round(24 * (1 - expected))
+  );
+
+  return {
+    id: `settlement:${match.matchId}`,
+    outcome,
+    winnerId,
+    loserId,
+    winnerDelta,
+    loserDelta: -winnerDelta,
+    turns: Math.max(0, num(turns)),
+    economy: {
+      required: false,
+      status: 'not_required',
+      stakeEach: 0,
+      escrow: 0
+    },
+    createdAt: now()
+  };
+}
+
 async function applyRankedProfileSettlement({
   playerId,
   matchId,
@@ -3894,30 +4023,38 @@ async function applyRankedProfileSettlement({
 async function settleRankedMatch(matchId) {
   const key = rankedMatchKey(matchId);
 
-  for (let attempt = 0; attempt < 8; attempt++) {
+  for (let attempt = 0; attempt < 10; attempt++) {
     const row = await kvGet(key);
     if (!row) throw new Error('ranked_match_not_found');
 
     const match = payload(row);
 
-    if (match.status === 'settled' || match.status === 'disputed') {
-      return match;
-    }
-
-    if (Object.keys(match.submissions || {}).length < 2) {
+    if (isRankedTerminal(match.status)) {
       return match;
     }
 
     if (match.status === 'pending') {
+      if (Object.keys(match.submissions || {}).length < 2) {
+        return match;
+      }
+
       const check = validateRankedSubmissions(match);
 
       if (!check.ok) {
-        const disputed = {
-          ...match,
-          status: 'disputed',
-          validation: check,
-          updatedAt: now()
-        };
+        const disputed = transitionRankedMatch(
+          match,
+          'disputed',
+          {
+            reason: check.reason,
+            extra: {
+              validation: check,
+              economy: {
+                required: false,
+                status: 'not_required'
+              }
+            }
+          }
+        );
 
         if (await kvCompareAndPut({
           row,
@@ -3932,38 +4069,25 @@ async function settleRankedMatch(matchId) {
         continue;
       }
 
-      const [winnerProfile, loserProfile] = await Promise.all([
-        kvGet(`profile:${check.winnerId}`),
-        kvGet(`profile:${check.loserId}`)
-      ]);
+      const settlement = await buildRankedSettlementPlan({
+        match,
+        winnerId: check.winnerId,
+        loserId: check.loserId,
+        outcome: 'completed',
+        turns: check.turns
+      });
 
-      const winnerRating = Math.max(
-        100,
-        num(payload(winnerProfile).rating, 1000)
+      const settling = transitionRankedMatch(
+        match,
+        'settling',
+        {
+          reason: 'validated',
+          extra: {
+            validation: check,
+            settlement
+          }
+        }
       );
-      const loserRating = Math.max(
-        100,
-        num(payload(loserProfile).rating, 1000)
-      );
-      const expected = 1 / (
-        1 + Math.pow(10, (loserRating - winnerRating) / 400)
-      );
-      const winnerDelta = Math.max(1, Math.round(24 * (1 - expected)));
-
-      const settling = {
-        ...match,
-        status: 'settling',
-        validation: check,
-        settlement: {
-          id: `settlement:${matchId}`,
-          winnerId: check.winnerId,
-          loserId: check.loserId,
-          winnerDelta,
-          loserDelta: -winnerDelta,
-          createdAt: now()
-        },
-        updatedAt: now()
-      };
 
       if (!await kvCompareAndPut({
         row,
@@ -3974,14 +4098,92 @@ async function settleRankedMatch(matchId) {
       })) {
         continue;
       }
+
+      continue;
     }
 
-    const latestRow = await kvGet(key);
-    const latest = payload(latestRow);
-    const settlement = latest.settlement;
+    if (match.status === 'forfeit_pending') {
+      const forfeit = match.forfeit || {};
+
+      if (
+        num(forfeit.deadlineAt) > now() ||
+        !match.participants?.includes(forfeit.loserId)
+      ) {
+        return match;
+      }
+
+      const loserId = forfeit.loserId;
+      const winnerId = otherRankedPlayer(
+        match.participants,
+        loserId
+      );
+
+      const settlement = await buildRankedSettlementPlan({
+        match,
+        winnerId,
+        loserId,
+        outcome: 'forfeit',
+        turns: 0
+      });
+
+      const settling = transitionRankedMatch(
+        match,
+        'settling',
+        {
+          reason: forfeit.reason || 'forfeit',
+          actorId: loserId,
+          extra: {
+            validation: {
+              ok: true,
+              reason: 'server_issued_forfeit',
+              winnerId,
+              loserId,
+              turns: 0
+            },
+            settlement
+          }
+        }
+      );
+
+      if (!await kvCompareAndPut({
+        row,
+        type: 'rankedMatch',
+        owner: match.roomId,
+        expiresAt: num(row.expires_at),
+        data: settling
+      })) {
+        continue;
+      }
+
+      continue;
+    }
+
+    if (match.status !== 'settling') {
+      return match;
+    }
+
+    const settlement = match.settlement;
 
     if (!settlement?.winnerId || !settlement?.loserId) {
-      throw new Error('ranked_settlement_plan_missing');
+      const disputed = transitionRankedMatch(
+        match,
+        'disputed',
+        {
+          reason: 'ranked_settlement_plan_missing'
+        }
+      );
+
+      if (await kvCompareAndPut({
+        row,
+        type: 'rankedMatch',
+        owner: match.roomId,
+        expiresAt: num(row.expires_at),
+        data: disputed
+      })) {
+        return disputed;
+      }
+
+      continue;
     }
 
     const [winner, loser] = await Promise.all([
@@ -3999,31 +4201,157 @@ async function settleRankedMatch(matchId) {
       })
     ]);
 
-    const settled = {
-      ...latest,
-      status: 'settled',
-      settlement: {
-        ...settlement,
-        winnerRating: winner.rating || 0,
-        loserRating: loser.rating || 0,
-        settledAt: now()
-      },
-      settledAt: now(),
-      updatedAt: now()
-    };
+    const terminalStatus =
+      settlement.outcome === 'forfeit'
+        ? 'forfeited'
+        : 'settled';
+
+    const completed = transitionRankedMatch(
+      match,
+      terminalStatus,
+      {
+        reason:
+          settlement.outcome === 'forfeit'
+            ? 'server_issued_forfeit'
+            : 'settled',
+        actorId:
+          settlement.outcome === 'forfeit'
+            ? settlement.loserId
+            : '',
+        extra: {
+          settlement: {
+            ...settlement,
+            winnerRating: winner.rating || 0,
+            loserRating: loser.rating || 0,
+            settledAt: now()
+          },
+          settledAt: now()
+        }
+      }
+    );
 
     if (await kvCompareAndPut({
-      row: latestRow,
+      row,
       type: 'rankedMatch',
-      owner: latest.roomId,
-      expiresAt: num(latestRow.expires_at),
-      data: settled
+      owner: match.roomId,
+      expiresAt: num(row.expires_at),
+      data: completed
     })) {
-      return settled;
+      return completed;
     }
   }
 
   throw new Error('ranked_settlement_conflict');
+}
+
+async function reconcileRankedMatch(matchId) {
+  const key = rankedMatchKey(matchId);
+
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const row = await kvGet(key);
+    if (!row) throw new Error('ranked_match_not_found');
+
+    const match = payload(row);
+
+    if (
+      isRankedTerminal(match.status) ||
+      match.status === 'settling'
+    ) {
+      return match.status === 'settling'
+        ? settleRankedMatch(matchId)
+        : match;
+    }
+
+    if (match.status === 'forfeit_pending') {
+      return num(match.forfeit?.deadlineAt) <= now()
+        ? settleRankedMatch(matchId)
+        : match;
+    }
+
+    if (match.status !== 'pending') return match;
+
+    const submissions = Object.values(
+      match.submissions || {}
+    );
+    const age = now() - num(match.createdAt);
+
+    if (submissions.length === 1) {
+      const submittedAt = num(
+        submissions[0]?.submittedAt
+      );
+
+      if (
+        submittedAt > 0 &&
+        now() - submittedAt >=
+          RANKED_SUBMISSION_TIMEOUT_MS
+      ) {
+        const disputed = transitionRankedMatch(
+          match,
+          'disputed',
+          {
+            reason: 'ranked_peer_submission_timeout',
+            extra: {
+              validation: {
+                ok: false,
+                reason: 'ranked_peer_submission_timeout'
+              },
+              economy: {
+                required: false,
+                status: 'not_required'
+              }
+            }
+          }
+        );
+
+        if (await kvCompareAndPut({
+          row,
+          type: 'rankedMatch',
+          owner: match.roomId,
+          expiresAt: num(row.expires_at),
+          data: disputed
+        })) {
+          return disputed;
+        }
+
+        continue;
+      }
+    }
+
+    if (
+      submissions.length === 0 &&
+      age >= RANKED_ABANDONED_TIMEOUT_MS
+    ) {
+      const aborted = transitionRankedMatch(
+        match,
+        'aborted',
+        {
+          reason: 'ranked_abandoned',
+          extra: {
+            economy: {
+              required: false,
+              status: 'not_required'
+            }
+          }
+        }
+      );
+
+      if (await kvCompareAndPut({
+        row,
+        type: 'rankedMatch',
+        owner: match.roomId,
+        expiresAt: num(row.expires_at),
+        data: aborted
+      })) {
+        return aborted;
+      }
+
+      continue;
+    }
+
+    return match;
+  }
+
+  throw new Error('ranked_reconcile_conflict');
 }
 
 function publicRankedMatch(match, playerId) {
@@ -4032,14 +4360,31 @@ function publicRankedMatch(match, playerId) {
     roomId: match.roomId,
     gameId: match.gameId,
     status: match.status,
+    terminal: isRankedTerminal(match.status),
+    terminalReason: safe(match.terminalReason || ''),
+    terminalActorId: safe(match.terminalActorId || ''),
     participants: match.participants,
     submitted: !!match.submissions?.[playerId],
     submissions: Object.keys(match.submissions || {}).length,
     validation: match.validation || null,
     settlement: match.settlement || null,
+    forfeit: match.forfeit
+      ? {
+          loserId: match.forfeit.loserId,
+          reason: match.forfeit.reason,
+          requestedAt: num(match.forfeit.requestedAt),
+          deadlineAt: num(match.forfeit.deadlineAt)
+        }
+      : null,
+    economy: match.economy || {
+      required: false,
+      status: 'not_required'
+    },
     createdAt: num(match.createdAt),
     updatedAt: num(match.updatedAt),
-    settledAt: num(match.settledAt)
+    terminalAt: num(match.terminalAt),
+    settledAt: num(match.settledAt),
+    refundedAt: num(match.refundedAt)
   };
 }
 
@@ -4097,8 +4442,9 @@ async function actionRankedMatchPrepare(event, body) {
       : null;
 
     const currentMatch = payload(currentMatchRow);
-    const terminal = ['settled', 'disputed']
-      .includes(currentMatch.status);
+    const terminal = isRankedTerminal(
+      currentMatch.status
+    );
 
     if (
       currentMatchRow &&
@@ -4188,7 +4534,7 @@ async function actionRankedMatchSubmit(event, body) {
       throw new Error('ranked_match_forbidden');
     }
 
-    if (match.status === 'settled' || match.status === 'disputed') {
+    if (isRankedTerminal(match.status)) {
       return {
         ok: true,
         duplicate: true,
@@ -4249,7 +4595,151 @@ async function actionRankedMatchSubmit(event, body) {
 
   throw new Error('ranked_submission_conflict');
 }
+async function actionRankedMatchAbort(event, body) {
+  const { playerId } = await requirePlayer(event, body);
+  const matchId = sanitizeId(body.matchId, 120);
+  const reason = sanitizeId(
+    body.reason || 'disconnect',
+    80
+  );
 
+  if (!matchId) throw new Error('ranked_match_required');
+
+  const key = rankedMatchKey(matchId);
+
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const row = await kvGet(key);
+    if (!row) throw new Error('ranked_match_not_found');
+
+    const match = payload(row);
+
+    if (!match.participants?.includes(playerId)) {
+      throw new Error('ranked_match_forbidden');
+    }
+
+    if (isRankedTerminal(match.status)) {
+      return {
+        ok: true,
+        duplicate: true,
+        match: publicRankedMatch(match, playerId)
+      };
+    }
+
+    if (match.status === 'settling') {
+      const current = await settleRankedMatch(matchId);
+      return {
+        ok: true,
+        duplicate: true,
+        match: publicRankedMatch(current, playerId)
+      };
+    }
+
+    const explicit = [
+      'surrender',
+      'user_exit'
+    ].includes(reason);
+
+    const requestedAt = now();
+    const deadlineAt = explicit
+      ? requestedAt
+      : requestedAt + RANKED_FORFEIT_GRACE_MS;
+
+    const next = transitionRankedMatch(
+      match,
+      'forfeit_pending',
+      {
+        reason,
+        actorId: playerId,
+        extra: {
+          forfeit: {
+            loserId: playerId,
+            winnerId: otherRankedPlayer(
+              match.participants,
+              playerId
+            ),
+            reason,
+            explicit,
+            requestedAt,
+            deadlineAt
+          }
+        }
+      }
+    );
+
+    if (!await kvCompareAndPut({
+      row,
+      type: 'rankedMatch',
+      owner: match.roomId,
+      expiresAt: num(row.expires_at),
+      data: next
+    })) {
+      continue;
+    }
+
+    const current = explicit
+      ? await settleRankedMatch(matchId)
+      : next;
+
+    return {
+      ok: true,
+      duplicate: false,
+      match: publicRankedMatch(current, playerId)
+    };
+  }
+
+  throw new Error('ranked_abort_conflict');
+}
+
+async function actionRankedMatchCleanup(event, body) {
+  const admin = headerValue(event, 'x-vi3-admin') ||
+    safe(body.adminSecret);
+
+  if (
+    !CFG.adminSecret ||
+    !timingSafeEqualText(admin, CFG.adminSecret)
+  ) {
+    throw new Error('bad_admin_secret');
+  }
+
+  const rows = await kvPrefix('rankedMatch:', 500);
+  const results = [];
+
+  for (const row of rows) {
+    const match = payload(row);
+
+    if (!match.matchId || isRankedTerminal(match.status)) {
+      continue;
+    }
+
+    try {
+      const current = await reconcileRankedMatch(
+        match.matchId
+      );
+
+      if (current.status !== match.status) {
+        results.push({
+          matchId: match.matchId,
+          from: match.status,
+          to: current.status
+        });
+      }
+    } catch (error) {
+      results.push({
+        matchId: match.matchId,
+        from: match.status,
+        to: 'error',
+        error: safe(error?.message)
+      });
+    }
+  }
+
+  return {
+    ok: true,
+    scanned: rows.length,
+    changed: results.length,
+    results
+  };
+}
 async function actionRankedMatchStatus(event, body) {
   const { playerId } = await requirePlayer(event, body);
   const matchId = sanitizeId(body.matchId, 120);
@@ -4259,13 +4749,12 @@ async function actionRankedMatchStatus(event, body) {
   const match = payload(row);
 
   if (!row) throw new Error('ranked_match_not_found');
+
   if (!match.participants?.includes(playerId)) {
     throw new Error('ranked_match_forbidden');
   }
 
-  const current = match.status === 'settling'
-    ? await settleRankedMatch(matchId)
-    : match;
+  const current = await reconcileRankedMatch(matchId);
 
   return {
     ok: true,
@@ -4594,6 +5083,8 @@ const ACTIONS = {
   ranked_match_prepare: actionRankedMatchPrepare,
   ranked_match_submit: actionRankedMatchSubmit,
   ranked_match_status: actionRankedMatchStatus,
+  ranked_match_abort: actionRankedMatchAbort,
+  ranked_match_cleanup: actionRankedMatchCleanup,
   leaderboard_v2_get: actionLeaderboardV2Get,
   wallet_get: actionWalletGet,
   wallet_purchase_avatar: actionWalletPurchaseAvatar,
