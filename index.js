@@ -296,9 +296,9 @@ function parseListenTrackCatalog(raw) {
   let parsed;
 
   try {
-    parsed = JSON.parse(String(raw || '[]'));
+    parsed = JSON.parse(String(raw || '{}'));
   } catch {
-    parsed = [];
+    parsed = {};
   }
 
   const rows = Array.isArray(parsed)
@@ -307,33 +307,48 @@ function parseListenTrackCatalog(raw) {
         parsed && typeof parsed === 'object'
           ? parsed
           : {}
-      ).map(([uid, value]) => ({
-        uid,
-        ...(value && typeof value === 'object'
-          ? value
-          : { duration: value })
-      }));
+      ).map(([uid, value]) => {
+        if (Array.isArray(value)) {
+          return {
+            uid,
+            duration: value[0],
+            album: value[1]
+          };
+        }
+
+        return {
+          uid,
+          ...(value && typeof value === 'object'
+            ? value
+            : { duration: value })
+        };
+      });
 
   return new Map(
     rows
       .map(item => {
         const uid = sanitizeId(item?.uid, 160);
-        const duration = Math.max(
-          10,
-          Math.min(7200, num(item?.duration))
-        );
+        const rawDuration = Number(item?.duration);
         const album = sanitizeId(item?.album, 120);
 
-        return uid && duration >= 10
-          ? [
-              uid,
-              Object.freeze({
-                uid,
-                duration,
-                album
-              })
-            ]
-          : null;
+        if (
+          !uid ||
+          !album ||
+          !Number.isFinite(rawDuration) ||
+          rawDuration < 10 ||
+          rawDuration > 7200
+        ) {
+          return null;
+        }
+
+        return [
+          uid,
+          Object.freeze({
+            uid,
+            duration: Math.round(rawDuration * 1000) / 1000,
+            album
+          })
+        ];
       })
       .filter(Boolean)
   );
@@ -3648,7 +3663,9 @@ function applyListenObservation(
     session: {
       ...current,
       lastHeartbeatAt: at,
-      lastPosition: position,
+      lastPosition: accepted
+        ? position
+        : current.lastPosition,
       observedMs: current.observedMs + creditMs,
       acceptedHeartbeats:
         current.acceptedHeartbeats +
