@@ -3154,6 +3154,224 @@ async function actionVoiceCallEnd(event, body) {
   return { ok: true, ended: true };
 }
 
+const SHARD_WALLET_VERSION = 1;
+const SHARD_AVATAR_CATALOG = Object.freeze([
+  Object.freeze({
+    id: 'avatar_dragon',
+    avatar: '🐉',
+    title: 'Дракон Витрины',
+    price: 100
+  }),
+  Object.freeze({
+    id: 'avatar_planet',
+    avatar: '🪐',
+    title: 'Осколок Вселенной',
+    price: 500
+  }),
+  Object.freeze({
+    id: 'avatar_crown',
+    avatar: '👑',
+    title: 'Корона Башни',
+    price: 1000
+  })
+]);
+
+function walletKey(playerId) {
+  return `wallet:${sanitizeId(playerId, 96)}`;
+}
+
+function normalizeShardWallet(raw, playerId) {
+  const wallet = raw && typeof raw === 'object'
+    ? raw
+    : {};
+
+  return {
+    version: SHARD_WALLET_VERSION,
+    playerId: sanitizeId(playerId, 96),
+    balance: Math.max(0, Math.floor(num(wallet.balance))),
+    locked: Math.max(0, Math.floor(num(wallet.locked))),
+    earned: Math.max(0, Math.floor(num(wallet.earned))),
+    spent: Math.max(0, Math.floor(num(wallet.spent))),
+    purchasedAvatarIds: [...new Set(
+      (Array.isArray(wallet.purchasedAvatarIds)
+        ? wallet.purchasedAvatarIds
+        : [])
+        .map(value => sanitizeId(value, 80))
+        .filter(Boolean)
+    )].slice(0, 100),
+    purchaseIds: [...new Set(
+      (Array.isArray(wallet.purchaseIds)
+        ? wallet.purchaseIds
+        : [])
+        .map(value => sanitizeId(value, 120))
+        .filter(Boolean)
+    )].slice(-100),
+    createdAt: num(wallet.createdAt) || now(),
+    updatedAt: num(wallet.updatedAt) || now()
+  };
+}
+
+function publicShardWallet(wallet) {
+  const normalized = normalizeShardWallet(
+    wallet,
+    wallet?.playerId
+  );
+
+  return {
+    available: true,
+    version: normalized.version,
+    shards: normalized.balance,
+    locked: normalized.locked,
+    spendable: Math.max(
+      0,
+      normalized.balance - normalized.locked
+    ),
+    earned: normalized.earned,
+    spent: normalized.spent,
+    purchasedAvatarIds: normalized.purchasedAvatarIds,
+    purchasedAvatars: SHARD_AVATAR_CATALOG
+      .filter(item =>
+        normalized.purchasedAvatarIds.includes(item.id)
+      )
+      .map(item => ({
+        id: item.id,
+        avatar: item.avatar,
+        title: item.title
+      })),
+    updatedAt: normalized.updatedAt
+  };
+}
+
+async function getOrCreateShardWallet(playerId) {
+  const key = walletKey(playerId);
+  const row = await kvGet(key);
+
+  if (row) {
+    return {
+      row,
+      wallet: normalizeShardWallet(
+        payload(row),
+        playerId
+      )
+    };
+  }
+
+  const wallet = normalizeShardWallet({}, playerId);
+
+  await kvPut({
+    pk: key,
+    type: 'wallet',
+    owner: playerId,
+    data: wallet
+  });
+
+  return {
+    row: await kvGet(key),
+    wallet
+  };
+}
+
+async function actionWalletGet(event, body) {
+  const { playerId } = await requirePlayer(event, body);
+  const { wallet } = await getOrCreateShardWallet(playerId);
+
+  return {
+    ok: true,
+    wallet: publicShardWallet(wallet),
+    catalog: SHARD_AVATAR_CATALOG
+  };
+}
+
+async function actionWalletPurchaseAvatar(event, body) {
+  const { playerId } = await requirePlayer(event, body);
+  const itemId = sanitizeId(body.itemId, 80);
+  const purchaseId = sanitizeId(body.purchaseId, 120);
+
+  if (!purchaseId) {
+    throw new Error('wallet_purchase_id_required');
+  }
+
+  const item = SHARD_AVATAR_CATALOG.find(
+    candidate => candidate.id === itemId
+  );
+
+  if (!item) {
+    throw new Error('wallet_item_not_found');
+  }
+
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const { row, wallet } =
+      await getOrCreateShardWallet(playerId);
+
+    if (wallet.purchaseIds.includes(purchaseId)) {
+      return {
+        ok: true,
+        duplicate: true,
+        item,
+        wallet: publicShardWallet(wallet)
+      };
+    }
+
+    if (wallet.purchasedAvatarIds.includes(item.id)) {
+      return {
+        ok: true,
+        duplicate: true,
+        owned: true,
+        item,
+        wallet: publicShardWallet(wallet)
+      };
+    }
+
+    const spendable = Math.max(
+      0,
+      wallet.balance - wallet.locked
+    );
+
+    if (spendable < item.price) {
+      return {
+        ok: false,
+        reason: 'wallet_insufficient_shards',
+        required: item.price,
+        available: spendable,
+        wallet: publicShardWallet(wallet)
+      };
+    }
+
+    const next = {
+      ...wallet,
+      balance: wallet.balance - item.price,
+      spent: wallet.spent + item.price,
+      purchasedAvatarIds: [
+        ...wallet.purchasedAvatarIds,
+        item.id
+      ],
+      purchaseIds: [
+        ...wallet.purchaseIds,
+        purchaseId
+      ].slice(-100),
+      updatedAt: now()
+    };
+
+    const changed = await kvCompareAndPut({
+      row,
+      type: 'wallet',
+      owner: playerId,
+      data: next
+    });
+
+    if (!changed) continue;
+
+    return {
+      ok: true,
+      duplicate: false,
+      item,
+      wallet: publicShardWallet(next)
+    };
+  }
+
+  throw new Error('wallet_purchase_conflict');
+}
+
 const RANKED_GAME_ID = 'war_hearts';
 const RANKED_BOARD_SIZE = 10;
 const RANKED_FLEET = [4, 3, 3, 2, 2, 2, 1, 1, 1, 1];
@@ -4377,6 +4595,8 @@ const ACTIONS = {
   ranked_match_submit: actionRankedMatchSubmit,
   ranked_match_status: actionRankedMatchStatus,
   leaderboard_v2_get: actionLeaderboardV2Get,
+  wallet_get: actionWalletGet,
+  wallet_purchase_avatar: actionWalletPurchaseAvatar,
   rtc_config: actionRtcConfig,
   webpush_config: actionWebPushConfig,
   webpush_subscribe: actionWebPushSubscribe,
