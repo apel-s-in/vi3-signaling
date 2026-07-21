@@ -1074,8 +1074,8 @@ async function actionRoomJoinTokenRedeem(event, body) {
   }
 
   if (
-    data.redeemedByPlayerId &&
-    data.redeemedByPlayerId !== playerId
+    num(data.redeemedAt) > 0 ||
+    data.redeemedByPlayerId
   ) {
     return {
       ok: false,
@@ -1083,33 +1083,25 @@ async function actionRoomJoinTokenRedeem(event, body) {
     };
   }
 
-  if (!data.redeemedByPlayerId) {
-    const updated = {
-      ...data,
-      redeemedAt: now(),
-      redeemedByPlayerId: playerId
+  const updated = {
+    ...data,
+    redeemedAt: now(),
+    redeemedByPlayerId: playerId
+  };
+
+  const changed = await kvCompareAndPut({
+    row,
+    type: 'roomJoinToken',
+    owner: data.createdByPlayerId || '',
+    expiresAt: num(data.expiresAt),
+    data: updated
+  });
+
+  if (!changed) {
+    return {
+      ok: false,
+      reason: 'room_join_token_used'
     };
-
-    const changed = await kvCompareAndPut({
-      row,
-      type: 'roomJoinToken',
-      owner: data.createdByPlayerId || '',
-      expiresAt: num(data.expiresAt),
-      data: updated
-    });
-
-    if (!changed) {
-      const latest = await getRoomJoinToken(token);
-
-      if (
-        latest.data.redeemedByPlayerId !== playerId
-      ) {
-        return {
-          ok: false,
-          reason: 'room_join_token_used'
-        };
-      }
-    }
   }
 
   return {
@@ -1460,7 +1452,7 @@ async function actionGameInviteSet(event, body, status) {
   return { ok: true, invite: inv };
 }
 
-// ===== FRIENDS MODULE (Phase A) =====
+// ===== FRIENDS / E2EE V2 =====
 
 async function actionProfileSet(event, body) {
   const { playerId } = await requirePlayer(event, body);
@@ -1632,7 +1624,7 @@ async function actionPushSend(event, body) {
 
   const pushId = rid('push');
   const kind = safe(body.kind || 'GENERIC').slice(0, 40);
-  const gameId = sanitizeId(body.gameId || '');
+  let gameId = sanitizeId(body.gameId || '');
   const joinToken = safe(body.joinToken || '').slice(0, 180);
   const text = safe(body.text || '').slice(0, 300);
 
@@ -1641,9 +1633,17 @@ async function actionPushSend(event, body) {
   if (kind === 'GAME_INVITE') {
     const join = await getRoomJoinToken(joinToken);
 
+    const tokenGameId = sanitizeId(
+      join.data.gameId || ''
+    );
+
     if (
       !join.row ||
       join.data.createdByPlayerId !== playerId ||
+      num(join.data.redeemedAt) > 0 ||
+      join.data.redeemedByPlayerId ||
+      !tokenGameId ||
+      (gameId && gameId !== tokenGameId) ||
       (
         join.data.invitedPlayerId &&
         join.data.invitedPlayerId !== toFriendId
@@ -1652,6 +1652,7 @@ async function actionPushSend(event, body) {
       throw new Error('game_join_token_invalid');
     }
 
+    gameId = tokenGameId;
     gameRoomId = sanitizeId(join.data.roomId);
   }
   const createdAt = now();
