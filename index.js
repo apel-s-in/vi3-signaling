@@ -4020,7 +4020,7 @@ async function actionListenSessionStart(event, body) {
       return {
         ok: true,
         duplicate: true,
-        shadow: true,
+        shadow: CFG.listeningReceiptsShadow,
         session: publicListenSession(current)
       };
     }
@@ -4074,7 +4074,7 @@ async function actionListenSessionStart(event, body) {
         return {
           ok: true,
           duplicate: false,
-          shadow: true,
+          shadow: CFG.listeningReceiptsShadow,
           session: publicListenSession(session)
         };
       } catch {
@@ -4106,7 +4106,7 @@ async function actionListenSessionStart(event, body) {
     return {
       ok: true,
       duplicate: false,
-      shadow: true,
+      shadow: CFG.listeningReceiptsShadow,
       session: publicListenSession(session)
     };
   }
@@ -4153,7 +4153,7 @@ async function actionListenSessionHeartbeat(event, body) {
         ok: true,
         throttled: true,
         accepted: false,
-        shadow: true,
+        shadow: CFG.listeningReceiptsShadow,
         session: publicListenSession(session)
       };
     }
@@ -4176,7 +4176,7 @@ async function actionListenSessionHeartbeat(event, body) {
       throttled: false,
       accepted: observation.accepted,
       creditedMs: observation.creditMs,
-      shadow: true,
+      shadow: CFG.listeningReceiptsShadow,
       session: publicListenSession(
         observation.session
       )
