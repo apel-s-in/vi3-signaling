@@ -358,6 +358,85 @@ const LISTEN_TRACK_CATALOG = parseListenTrackCatalog(
   process.env.LISTEN_TRACK_CATALOG_JSON
 );
 
+const LISTEN_ALBUM_TRACKS = new Map();
+
+for (const track of LISTEN_TRACK_CATALOG.values()) {
+  if (!LISTEN_ALBUM_TRACKS.has(track.album)) {
+    LISTEN_ALBUM_TRACKS.set(track.album, []);
+  }
+
+  LISTEN_ALBUM_TRACKS.get(track.album).push(track.uid);
+}
+
+const buildScaledRewards = ({
+  id,
+  metric,
+  targets,
+  xpBase,
+  xpMultiplier
+}) => targets.map((target, index) => ({
+  id: `${id}_${index + 1}`,
+  metric,
+  target,
+  amount: Math.floor(
+    xpBase * Math.pow(xpMultiplier, index)
+  ),
+  validatorVersion: 1
+}));
+
+const ACHIEVEMENT_REWARD_CATALOG = Object.freeze([
+  ...buildScaledRewards({
+    id: 'play_total',
+    metric: 'validPlays',
+    targets: [1, 25, 100, 500, 1000, 5000],
+    xpBase: 10,
+    xpMultiplier: 1.5
+  }),
+  ...buildScaledRewards({
+    id: 'full_total',
+    metric: 'fullPlays',
+    targets: [1, 10, 50, 100, 500, 1000],
+    xpBase: 15,
+    xpMultiplier: 1.8
+  }),
+  ...buildScaledRewards({
+    id: 'time_total',
+    metric: 'totalSec',
+    targets: [3600, 18000, 36000, 86400, 360000],
+    xpBase: 25,
+    xpMultiplier: 2
+  }),
+  ...buildScaledRewards({
+    id: 'streak_base',
+    metric: 'streak',
+    targets: [3, 7, 14, 30, 100, 365],
+    xpBase: 30,
+    xpMultiplier: 1.8
+  }),
+  ...buildScaledRewards({
+    id: 'unique_tracks',
+    metric: 'uniqueTracks',
+    targets: [5, 10, 16, 50, 100],
+    xpBase: 20,
+    xpMultiplier: 1.5
+  }),
+  ...buildScaledRewards({
+    id: 'one_track_full',
+    metric: 'maxOneTrackFull',
+    targets: [10, 25, 100, 500],
+    xpBase: 50,
+    xpMultiplier: 2
+  }),
+  ...[...LISTEN_ALBUM_TRACKS.keys()].map(album => ({
+    id: `album_complete_${album}`,
+    metric: 'albumComplete',
+    album,
+    target: 1,
+    amount: 150,
+    validatorVersion: 1
+  }))
+]);
+
 function payload(row) {
   try {
     return row?.payload_json ? JSON.parse(row.payload_json) : {};
@@ -579,15 +658,24 @@ async function kvCompareAndPut({
 }) {
   if (!row?.pk) throw new Error('cas_row_required');
 
-  const expectedUpdatedAt = num(row.updated_at);
+  const expectedPayloadJson = safe(row.payload_json);
+  if (!expectedPayloadJson) {
+    throw new Error('cas_payload_required');
+  }
+
   const nextUpdatedAt = Math.max(
     now(),
-    expectedUpdatedAt + 1
+    num(row.updated_at) + 1
   );
+  const casToken = rid('cas');
+  const storedData = {
+    ...(data || {}),
+    __casToken: casToken
+  };
 
-  const result = await query(`
+  await query(`
     DECLARE $pk AS Utf8;
-    DECLARE $expected_updated_at AS Uint64;
+    DECLARE $expected_payload_json AS Utf8;
     DECLARE $type AS Utf8;
     DECLARE $owner AS Utf8;
     DECLARE $next_updated_at AS Uint64;
@@ -602,33 +690,19 @@ async function kvCompareAndPut({
       expires_at = $expires_at,
       payload_json = $payload_json
     WHERE pk = $pk
-      AND updated_at = $expected_updated_at
-    RETURNING pk, updated_at;
+      AND payload_json = $expected_payload_json;
   `, {
     '$pk': tvUtf8(row.pk),
-    '$expected_updated_at': tvUint64(expectedUpdatedAt),
+    '$expected_payload_json': tvUtf8(expectedPayloadJson),
     '$type': tvUtf8(type),
     '$owner': tvUtf8(owner),
     '$next_updated_at': tvUint64(nextUpdatedAt),
     '$expires_at': tvUint64(expiresAt),
-    '$payload_json': tvUtf8(JSON.stringify(data || {}))
+    '$payload_json': tvUtf8(JSON.stringify(storedData))
   });
 
-  const changed = rowsOf(result)[0] || null;
-
-  if (
-    changed?.pk === row.pk &&
-    num(changed.updated_at) === nextUpdatedAt
-  ) {
-    return true;
-  }
-
   const verified = await kvGet(row.pk);
-
-  return !!verified &&
-    num(verified.updated_at) === nextUpdatedAt &&
-    stableStringify(payload(verified)) ===
-      stableStringify(data || {});
+  return payload(verified)?.__casToken === casToken;
 }
 
 async function kvDelete(pk) {
@@ -3555,8 +3629,8 @@ function publicAchievementProgress(progress) {
 
   return {
     version: data.version,
-    shadow: true,
-    rewardsEnabled: false,
+    shadow: CFG.listeningReceiptsShadow,
+    rewardsEnabled: !CFG.listeningReceiptsShadow,
     validPlays: data.validPlays,
     fullPlays: data.fullPlays,
     totalSec: data.totalSec,
@@ -3839,19 +3913,78 @@ async function finalizeListenSession(session) {
     rewardGranted: false
   };
 
-  await kvPut({
-    pk: listenReceiptKey(data.playerId, receiptId),
-    type: 'listenReceipt',
-    owner: data.playerId,
-    expiresAt: now() + LISTEN_SESSION_RETENTION_MS,
-    data: receipt
-  });
+  const receiptPk = listenReceiptKey(
+    data.playerId,
+    receiptId
+  );
+  const oldReceiptRow = await kvGet(receiptPk);
+  const oldReceipt = payload(oldReceiptRow);
+
+  if (oldReceipt.progressApplied === true) {
+    const progress = normalizeAchievementProgress(
+      payload(await kvGet(
+        achievementProgressKey(data.playerId)
+      )),
+      data.playerId
+    );
+    const rewards = await reconcileAchievementRewards(
+      data.playerId,
+      progress
+    );
+
+    return {
+      receipt: oldReceipt,
+      progress,
+      rewards,
+      duplicate: true
+    };
+  }
+
+  if (!oldReceiptRow) {
+    try {
+      await kvInsert({
+        pk: receiptPk,
+        type: 'listenReceipt',
+        owner: data.playerId,
+        expiresAt: 0,
+        data: {
+          ...receipt,
+          progressApplied: false
+        }
+      });
+    } catch {}
+  }
 
   const applied = await applyListenReceiptProgress(receipt);
+  const rewards = await reconcileAchievementRewards(
+    data.playerId,
+    applied.progress
+  );
+  const completedReceipt = {
+    ...receipt,
+    progressApplied: true,
+    rewardGranted: rewards.grants.length > 0,
+    rewardAmount: rewards.grants.reduce(
+      (sum, grant) => sum + grant.amount,
+      0
+    ),
+    rewardIds: rewards.grants.map(
+      grant => grant.achievementId
+    )
+  };
+
+  await kvPut({
+    pk: receiptPk,
+    type: 'listenReceipt',
+    owner: data.playerId,
+    expiresAt: 0,
+    data: completedReceipt
+  });
 
   return {
-    receipt,
+    receipt: completedReceipt,
     progress: applied.progress,
+    rewards,
     duplicate: applied.duplicate
   };
 }
@@ -4077,8 +4210,13 @@ async function actionListenSessionComplete(event, body) {
       return {
         ok: true,
         duplicate: true,
-        shadow: true,
+        shadow: CFG.listeningReceiptsShadow,
+        rewardsEnabled: !CFG.listeningReceiptsShadow,
         receipt: finalized.receipt,
+        rewards: finalized.rewards?.grants || [],
+        wallet: finalized.rewards?.wallet
+          ? publicShardWallet(finalized.rewards.wallet)
+          : null,
         progress: publicAchievementProgress(
           finalized.progress
         )
@@ -4134,8 +4272,13 @@ async function actionListenSessionComplete(event, body) {
       duplicate: false,
       acceptedFinalObservation:
         observation.accepted === true,
-      shadow: true,
+      shadow: CFG.listeningReceiptsShadow,
+      rewardsEnabled: !CFG.listeningReceiptsShadow,
       receipt: finalized.receipt,
+      rewards: finalized.rewards?.grants || [],
+      wallet: finalized.rewards?.wallet
+        ? publicShardWallet(finalized.rewards.wallet)
+        : null,
       progress: publicAchievementProgress(
         finalized.progress
       )
@@ -4156,24 +4299,31 @@ async function actionAchievementRewardStatus(event, body) {
     )),
     playerId
   );
+  const rewards = await reconcileAchievementRewards(
+    playerId,
+    progress
+  );
 
   return {
     ok: true,
-    shadow: true,
-    rewardsEnabled: false,
+    shadow: CFG.listeningReceiptsShadow,
+    rewardsEnabled: !CFG.listeningReceiptsShadow,
     conversion: {
       xpToShards: 1,
       rule: '1_xp_equals_1_shard'
     },
     catalog: {
       configured: LISTEN_TRACK_CATALOG.size > 0,
-      tracks: LISTEN_TRACK_CATALOG.size
+      tracks: LISTEN_TRACK_CATALOG.size,
+      rewards: ACHIEVEMENT_REWARD_CATALOG.length
     },
     activeSession:
       active.playerId === playerId &&
       active.status === 'active'
         ? publicListenSession(active)
         : null,
+    grants: rewards.grants,
+    wallet: publicShardWallet(rewards.wallet),
     progress: publicAchievementProgress(progress)
   };
 }
@@ -4423,7 +4573,24 @@ async function ensureRegistrationShardGrant(playerId) {
       data: next
     });
 
-    if (!changed) continue;
+    if (!changed) {
+      const current = normalizeShardWallet(
+        payload(await kvGet(walletKey(playerId))),
+        playerId
+      );
+
+      if (current.grantIds.includes(operationId)) {
+        return {
+          ok: true,
+          duplicate: true,
+          operationId,
+          amount: REGISTRATION_SHARD_REWARD,
+          wallet: current
+        };
+      }
+
+      continue;
+    }
 
     return {
       ok: true,
@@ -4435,6 +4602,189 @@ async function ensureRegistrationShardGrant(playerId) {
   }
 
   throw new Error('wallet_registration_grant_conflict');
+}
+async function applyAchievementShardGrant({
+  playerId,
+  achievementId,
+  amount,
+  validatorVersion = 1
+}) {
+  const cleanId = sanitizeId(achievementId, 120);
+  const reward = Math.max(0, Math.floor(num(amount)));
+  const operationId = [
+    'grant',
+    'achievement',
+    cleanId,
+    sanitizeId(playerId, 96)
+  ].join(':');
+
+  if (!cleanId || !reward) {
+    throw new Error('achievement_reward_invalid');
+  }
+
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const { row, wallet } =
+      await getOrCreateShardWallet(playerId);
+
+    if (wallet.grantIds?.includes(operationId)) {
+      return {
+        ok: true,
+        duplicate: true,
+        operationId,
+        achievementId: cleanId,
+        amount: reward,
+        wallet
+      };
+    }
+
+    const at = now();
+    const next = {
+      ...wallet,
+      balance: wallet.balance + reward,
+      earned: wallet.earned + reward,
+      grantIds: [...new Set([
+        ...(wallet.grantIds || []),
+        operationId
+      ])],
+      operations: trimWalletOperations({
+        ...(wallet.operations || {}),
+        [operationId]: {
+          kind: 'achievement_grant',
+          matchId: cleanId,
+          amount: reward,
+          validatorVersion,
+          at
+        }
+      }),
+      updatedAt: at
+    };
+
+    if (!await kvCompareAndPut({
+      row,
+      type: 'wallet',
+      owner: playerId,
+      data: next
+    })) {
+      continue;
+    }
+
+    return {
+      ok: true,
+      duplicate: false,
+      operationId,
+      achievementId: cleanId,
+      amount: reward,
+      wallet: next
+    };
+  }
+
+  throw new Error('achievement_reward_grant_conflict');
+}
+
+function achievementMetricValue(progress, reward) {
+  if (reward.metric === 'validPlays') {
+    return progress.validPlays;
+  }
+
+  if (reward.metric === 'fullPlays') {
+    return progress.fullPlays;
+  }
+
+  if (reward.metric === 'totalSec') {
+    return progress.totalSec;
+  }
+
+  if (reward.metric === 'uniqueTracks') {
+    return Object.keys(progress.uniqueTracks || {}).length;
+  }
+
+  if (reward.metric === 'maxOneTrackFull') {
+    return Math.max(
+      0,
+      ...Object.values(progress.perTrackFull || {})
+    );
+  }
+
+  if (reward.metric === 'streak') {
+    return calculateServerStreak(progress.activeDays);
+  }
+
+  if (reward.metric === 'albumComplete') {
+    const tracks = LISTEN_ALBUM_TRACKS.get(
+      reward.album
+    ) || [];
+
+    return tracks.length > 0 &&
+      tracks.every(uid =>
+        num(progress.perTrackFull?.[uid]) > 0
+      )
+      ? 1
+      : 0;
+  }
+
+  return 0;
+}
+
+async function reconcileAchievementRewards(
+  playerId,
+  progressRaw
+) {
+  const progress = normalizeAchievementProgress(
+    progressRaw,
+    playerId
+  );
+  const grants = [];
+  let latestWallet = null;
+
+  if (CFG.listeningReceiptsShadow) {
+    const registration =
+      await ensureRegistrationShardGrant(playerId);
+
+    return {
+      enabled: false,
+      grants,
+      wallet: registration.wallet
+    };
+  }
+
+  for (const reward of ACHIEVEMENT_REWARD_CATALOG) {
+    if (
+      achievementMetricValue(progress, reward) <
+      reward.target
+    ) {
+      continue;
+    }
+
+    const grant = await applyAchievementShardGrant({
+      playerId,
+      achievementId: reward.id,
+      amount: reward.amount,
+      validatorVersion: reward.validatorVersion
+    });
+
+    latestWallet = grant.wallet;
+
+    if (!grant.duplicate) {
+      grants.push({
+        achievementId: reward.id,
+        amount: reward.amount,
+        operationId: grant.operationId,
+        validatorVersion: reward.validatorVersion
+      });
+    }
+  }
+
+  if (!latestWallet) {
+    const registration =
+      await ensureRegistrationShardGrant(playerId);
+    latestWallet = registration.wallet;
+  }
+
+  return {
+    enabled: true,
+    grants,
+    wallet: latestWallet
+  };
 }
 
 async function actionWalletGet(event, body) {
