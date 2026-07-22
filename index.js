@@ -48,6 +48,8 @@ const CFG = {
   chatE2eeV2: safe(process.env.CHAT_E2EE_V2 || '0') === '1',
   listeningReceiptsShadow:
     safe(process.env.LISTENING_RECEIPTS_SHADOW || '1') === '1',
+  favoriteRewardsShadow:
+    safe(process.env.FAVORITE_REWARDS_SHADOW || '1') === '1',
   listenHeartbeatMinMs: Math.max(
     5000,
     Math.min(
@@ -426,6 +428,13 @@ const ACHIEVEMENT_REWARD_CATALOG = Object.freeze([
     targets: [10, 25, 100, 500],
     xpBase: 50,
     xpMultiplier: 2
+  }),
+  ...buildScaledRewards({
+    id: 'fav_total',
+    metric: 'favCount',
+    targets: [3, 5, 8, 15, 50],
+    xpBase: 10,
+    xpMultiplier: 1.4
   }),
   ...[...LISTEN_ALBUM_TRACKS.keys()].map(album => ({
     id: `album_complete_${album}`,
@@ -3425,6 +3434,460 @@ async function actionVoiceCallEnd(event, body) {
 
   return { ok: true, ended: true };
 }
+const FAVORITE_STATE_VERSION = 1;
+const FAVORITE_MUTATION_HISTORY_LIMIT = 500;
+
+function favoriteStateKey(playerId) {
+  return `favoriteState:${sanitizeId(playerId, 96)}`;
+}
+
+function normalizeFavoriteItem(uid, raw = {}) {
+  const trackUid = sanitizeId(uid || raw.uid, 160);
+  const track = LISTEN_TRACK_CATALOG.get(trackUid);
+
+  if (!track) return null;
+
+  const status = ['active', 'inactive', 'deleted']
+    .includes(safe(raw.status))
+    ? safe(raw.status)
+    : raw.deletedAt
+      ? 'deleted'
+      : raw.inactiveAt
+        ? 'inactive'
+        : 'active';
+
+  return {
+    uid: trackUid,
+    album: track.album,
+    status,
+    liked: status === 'active',
+    addedAt: Math.max(0, num(raw.addedAt)),
+    updatedAt: Math.max(0, num(raw.updatedAt)),
+    inactiveAt: status === 'inactive'
+      ? Math.max(0, num(raw.inactiveAt || raw.updatedAt))
+      : 0,
+    deletedAt: status === 'deleted'
+      ? Math.max(0, num(raw.deletedAt || raw.updatedAt))
+      : 0,
+    rewardEligible: raw.rewardEligible === true,
+    mutationId: sanitizeId(raw.mutationId, 160)
+  };
+}
+
+function normalizeFavoriteState(raw = {}, playerId = '') {
+  const sourceItems =
+    raw.items && typeof raw.items === 'object'
+      ? raw.items
+      : {};
+
+  const items = {};
+
+  Object.entries(sourceItems).forEach(([uid, item]) => {
+    const normalized = normalizeFavoriteItem(uid, item);
+    if (normalized) items[normalized.uid] = normalized;
+  });
+
+  return {
+    version: FAVORITE_STATE_VERSION,
+    playerId: sanitizeId(
+      playerId || raw.playerId,
+      96
+    ),
+    revision: Math.max(
+      0,
+      Math.floor(num(raw.revision))
+    ),
+    items,
+    mutationIds: [...new Set(
+      (Array.isArray(raw.mutationIds)
+        ? raw.mutationIds
+        : [])
+        .map(value => sanitizeId(value, 160))
+        .filter(Boolean)
+    )].slice(-FAVORITE_MUTATION_HISTORY_LIMIT),
+    bootstrapImportedAt: Math.max(
+      0,
+      num(raw.bootstrapImportedAt)
+    ),
+    createdAt: Math.max(
+      0,
+      num(raw.createdAt)
+    ) || now(),
+    updatedAt: Math.max(
+      0,
+      num(raw.updatedAt)
+    ) || now()
+  };
+}
+
+function publicFavoriteState(raw) {
+  const state = normalizeFavoriteState(
+    raw,
+    raw?.playerId
+  );
+
+  const items = Object.values(state.items)
+    .sort((left, right) =>
+      num(left.addedAt) - num(right.addedAt) ||
+      left.uid.localeCompare(right.uid)
+    );
+
+  return {
+    version: state.version,
+    revision: state.revision,
+    activeCount: items.filter(
+      item => item.status === 'active'
+    ).length,
+    rewardEligibleCount: items.filter(
+      item =>
+        item.status === 'active' &&
+        item.rewardEligible
+    ).length,
+    items: items.map(item => ({
+      uid: item.uid,
+      album: item.album,
+      status: item.status,
+      liked: item.status === 'active',
+      addedAt: item.addedAt,
+      updatedAt: item.updatedAt,
+      inactiveAt: item.inactiveAt,
+      deletedAt: item.deletedAt
+    })),
+    bootstrapImported:
+      state.bootstrapImportedAt > 0,
+    bootstrapImportedAt:
+      state.bootstrapImportedAt,
+    updatedAt: state.updatedAt
+  };
+}
+
+async function getOrCreateFavoriteState(playerId) {
+  const key = favoriteStateKey(playerId);
+  let row = await kvGet(key);
+
+  if (!row) {
+    const state = normalizeFavoriteState(
+      {},
+      playerId
+    );
+
+    try {
+      await kvInsert({
+        pk: key,
+        type: 'favoriteState',
+        owner: playerId,
+        data: state
+      });
+    } catch {}
+
+    row = await kvGet(key);
+  }
+
+  if (!row) {
+    throw new Error('favorite_state_create_failed');
+  }
+
+  return {
+    row,
+    state: normalizeFavoriteState(
+      payload(row),
+      playerId
+    )
+  };
+}
+
+function favoriteRewardCount(raw) {
+  const state = normalizeFavoriteState(
+    raw,
+    raw?.playerId
+  );
+
+  return Object.values(state.items)
+    .filter(item =>
+      item.status === 'active' &&
+      item.rewardEligible
+    )
+    .length;
+}
+
+async function actionFavoriteStateGet(event, body) {
+  const { playerId } = await requirePlayer(event, body);
+  const { state } =
+    await getOrCreateFavoriteState(playerId);
+
+  const progress = normalizeAchievementProgress(
+    payload(await kvGet(
+      achievementProgressKey(playerId)
+    )),
+    playerId
+  );
+
+  const rewards = await reconcileAchievementRewards(
+    playerId,
+    progress
+  );
+
+  return {
+    ok: true,
+    shadow: CFG.favoriteRewardsShadow,
+    rewardsEnabled:
+      !CFG.favoriteRewardsShadow,
+    state: publicFavoriteState(state),
+    rewards: rewards.grants,
+    wallet: rewards.wallet
+      ? publicShardWallet(rewards.wallet)
+      : null
+  };
+}
+
+async function actionFavoriteStateMutate(event, body) {
+  const { playerId } = await requirePlayer(event, body);
+
+  await enforceRateLimit({
+    scope: 'favorite_mutate',
+    actor: playerId,
+    limit: 180,
+    windowMs: 60 * 60 * 1000
+  });
+
+  const uid = sanitizeId(body.uid, 160);
+  const track = LISTEN_TRACK_CATALOG.get(uid);
+  const mutationId = sanitizeId(
+    body.mutationId,
+    160
+  );
+  const requestedStatus = sanitizeId(
+    body.status,
+    20
+  );
+
+  if (!track) {
+    throw new Error('favorite_track_not_catalogued');
+  }
+
+  if (!mutationId) {
+    throw new Error('favorite_mutation_id_required');
+  }
+
+  if (
+    !['active', 'inactive', 'deleted']
+      .includes(requestedStatus)
+  ) {
+    throw new Error('favorite_status_invalid');
+  }
+
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const { row, state } =
+      await getOrCreateFavoriteState(playerId);
+
+    if (state.mutationIds.includes(mutationId)) {
+      return {
+        ok: true,
+        duplicate: true,
+        shadow: CFG.favoriteRewardsShadow,
+        state: publicFavoriteState(state),
+        rewards: []
+      };
+    }
+
+    const at = now();
+    const old = state.items[uid] || null;
+
+    const item = normalizeFavoriteItem(uid, {
+      ...old,
+      uid,
+      album: track.album,
+      status: requestedStatus,
+      addedAt:
+        old?.addedAt ||
+        at,
+      updatedAt: at,
+      inactiveAt:
+        requestedStatus === 'inactive'
+          ? at
+          : 0,
+      deletedAt:
+        requestedStatus === 'deleted'
+          ? at
+          : 0,
+      rewardEligible:
+        requestedStatus === 'active'
+          ? true
+          : old?.rewardEligible === true,
+      mutationId
+    });
+
+    const next = normalizeFavoriteState({
+      ...state,
+      revision: state.revision + 1,
+      items: {
+        ...state.items,
+        [uid]: item
+      },
+      mutationIds: [
+        ...state.mutationIds,
+        mutationId
+      ],
+      updatedAt: at
+    }, playerId);
+
+    if (!await kvCompareAndPut({
+      row,
+      type: 'favoriteState',
+      owner: playerId,
+      data: next
+    })) {
+      continue;
+    }
+
+    const progress = normalizeAchievementProgress(
+      payload(await kvGet(
+        achievementProgressKey(playerId)
+      )),
+      playerId
+    );
+
+    const rewards =
+      await reconcileAchievementRewards(
+        playerId,
+        progress
+      );
+
+    return {
+      ok: true,
+      duplicate: false,
+      shadow: CFG.favoriteRewardsShadow,
+      rewardsEnabled:
+        !CFG.favoriteRewardsShadow,
+      mutationId,
+      item,
+      state: publicFavoriteState(next),
+      rewards: rewards.grants,
+      wallet: rewards.wallet
+        ? publicShardWallet(rewards.wallet)
+        : null
+    };
+  }
+
+  throw new Error('favorite_state_conflict');
+}
+
+async function actionFavoriteStateReconcile(
+  event,
+  body
+) {
+  const { playerId } = await requirePlayer(event, body);
+
+  await enforceRateLimit({
+    scope: 'favorite_reconcile',
+    actor: playerId,
+    limit: 20,
+    windowMs: 60 * 60 * 1000
+  });
+
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const { row, state } =
+      await getOrCreateFavoriteState(playerId);
+
+    if (
+      state.revision > 0 ||
+      Object.keys(state.items).length > 0
+    ) {
+      return {
+        ok: true,
+        imported: false,
+        reason: 'server_state_exists',
+        shadow: CFG.favoriteRewardsShadow,
+        state: publicFavoriteState(state)
+      };
+    }
+
+    const input = Array.isArray(body.items)
+      ? body.items.slice(
+          0,
+          LISTEN_TRACK_CATALOG.size
+        )
+      : [];
+
+    const items = {};
+    const at = now();
+
+    input.forEach(raw => {
+      const uid = sanitizeId(raw?.uid, 160);
+      const track = LISTEN_TRACK_CATALOG.get(uid);
+
+      if (!track) return;
+
+      const status = ['active', 'inactive', 'deleted']
+        .includes(safe(raw?.status))
+        ? safe(raw.status)
+        : raw?.deletedAt
+          ? 'deleted'
+          : raw?.inactiveAt
+            ? 'inactive'
+            : 'active';
+
+      const item = normalizeFavoriteItem(uid, {
+        uid,
+        album: track.album,
+        status,
+        addedAt: Math.max(
+          0,
+          num(raw?.addedAt)
+        ) || at,
+        updatedAt: at,
+        inactiveAt:
+          status === 'inactive'
+            ? at
+            : 0,
+        deletedAt:
+          status === 'deleted'
+            ? at
+            : 0,
+        rewardEligible: false,
+        mutationId: ''
+      });
+
+      if (item) items[uid] = item;
+    });
+
+    const next = normalizeFavoriteState({
+      ...state,
+      revision: Object.keys(items).length
+        ? 1
+        : 0,
+      items,
+      bootstrapImportedAt:
+        Object.keys(items).length
+          ? at
+          : 0,
+      updatedAt: at
+    }, playerId);
+
+    if (!await kvCompareAndPut({
+      row,
+      type: 'favoriteState',
+      owner: playerId,
+      data: next
+    })) {
+      continue;
+    }
+
+    return {
+      ok: true,
+      imported: Object.keys(items).length > 0,
+      reason: Object.keys(items).length
+        ? 'legacy_local_bootstrap'
+        : 'empty_local_state',
+      shadow: CFG.favoriteRewardsShadow,
+      state: publicFavoriteState(next)
+    };
+  }
+
+  throw new Error('favorite_reconcile_conflict');
+}
+
+const LISTEN_RECEIPT_VERSION = 1;
 const LISTEN_RECEIPT_VERSION = 1;
 const LISTEN_SESSION_RETENTION_MS =
   90 * 24 * 60 * 60 * 1000;
@@ -4299,6 +4762,13 @@ async function actionAchievementRewardStatus(event, body) {
     )),
     playerId
   );
+  const favoriteState = normalizeFavoriteState(
+    payload(await kvGet(
+      favoriteStateKey(playerId)
+    )),
+    playerId
+  );
+
   const rewards = await reconcileAchievementRewards(
     playerId,
     progress
@@ -4324,6 +4794,12 @@ async function actionAchievementRewardStatus(event, body) {
         : null,
     grants: rewards.grants,
     wallet: publicShardWallet(rewards.wallet),
+    favorites: {
+      shadow: CFG.favoriteRewardsShadow,
+      rewardsEnabled:
+        !CFG.favoriteRewardsShadow,
+      state: publicFavoriteState(favoriteState)
+    },
     progress: publicAchievementProgress(progress)
   };
 }
@@ -4681,7 +5157,11 @@ async function applyAchievementShardGrant({
   throw new Error('achievement_reward_grant_conflict');
 }
 
-function achievementMetricValue(progress, reward) {
+function achievementMetricValue(
+  progress,
+  reward,
+  context = {}
+) {
   if (reward.metric === 'validPlays') {
     return progress.validPlays;
   }
@@ -4707,6 +5187,11 @@ function achievementMetricValue(progress, reward) {
 
   if (reward.metric === 'streak') {
     return calculateServerStreak(progress.activeDays);
+  }
+  if (reward.metric === 'favCount') {
+    return favoriteRewardCount(
+      context.favoriteState || {}
+    );
   }
 
   if (reward.metric === 'albumComplete') {
@@ -4736,21 +5221,37 @@ async function reconcileAchievementRewards(
   const grants = [];
   let latestWallet = null;
 
-  if (CFG.listeningReceiptsShadow) {
-    const registration =
-      await ensureRegistrationShardGrant(playerId);
-
-    return {
-      enabled: false,
-      grants,
-      wallet: registration.wallet
-    };
-  }
+  const favoriteState = normalizeFavoriteState(
+    payload(await kvGet(
+      favoriteStateKey(playerId)
+    )),
+    playerId
+  );
 
   for (const reward of ACHIEVEMENT_REWARD_CATALOG) {
+    const favoriteMetric =
+      reward.metric === 'favCount';
+
     if (
-      achievementMetricValue(progress, reward) <
-      reward.target
+      favoriteMetric &&
+      CFG.favoriteRewardsShadow
+    ) {
+      continue;
+    }
+
+    if (
+      !favoriteMetric &&
+      CFG.listeningReceiptsShadow
+    ) {
+      continue;
+    }
+
+    if (
+      achievementMetricValue(
+        progress,
+        reward,
+        { favoriteState }
+      ) < reward.target
     ) {
       continue;
     }
@@ -4781,7 +5282,9 @@ async function reconcileAchievementRewards(
   }
 
   return {
-    enabled: true,
+    enabled:
+      !CFG.listeningReceiptsShadow ||
+      !CFG.favoriteRewardsShadow,
     grants,
     wallet: latestWallet
   };
@@ -7900,6 +8403,10 @@ const ACTIONS = {
   wallet_registration_backfill:
     actionWalletRegistrationBackfill,
   wallet_purchase_avatar: actionWalletPurchaseAvatar,
+  favorite_state_get: actionFavoriteStateGet,
+  favorite_state_mutate: actionFavoriteStateMutate,
+  favorite_state_reconcile:
+    actionFavoriteStateReconcile,
   listen_session_start: actionListenSessionStart,
   listen_session_heartbeat: actionListenSessionHeartbeat,
   listen_session_complete: actionListenSessionComplete,
@@ -7976,6 +8483,13 @@ exports.handler = async event => {
           shadow: CFG.listeningReceiptsShadow,
           catalogConfigured:
             LISTEN_TRACK_CATALOG.size > 0,
+          catalogTracks:
+            LISTEN_TRACK_CATALOG.size
+        },
+        favoriteMirror: {
+          enabled: true,
+          rewardsShadow:
+            CFG.favoriteRewardsShadow,
           catalogTracks:
             LISTEN_TRACK_CATALOG.size
         },
