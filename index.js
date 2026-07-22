@@ -3888,7 +3888,6 @@ async function actionFavoriteStateReconcile(
 }
 
 const LISTEN_RECEIPT_VERSION = 1;
-const LISTEN_RECEIPT_VERSION = 1;
 const LISTEN_SESSION_RETENTION_MS =
   90 * 24 * 60 * 60 * 1000;
 const LISTEN_PROGRESS_RECEIPT_LIMIT = 5000;
