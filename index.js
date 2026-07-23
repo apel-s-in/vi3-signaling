@@ -4684,14 +4684,27 @@ async function actionListenSessionComplete(event, body) {
     throw new Error('listen_session_required');
   }
 
-  const key = listenActiveKey(playerId);
+  const activeKey = listenActiveKey(playerId);
+  const historyKey = listenSessionKey(playerId, sessionId);
 
   for (let attempt = 0; attempt < 10; attempt++) {
-    const row = await kvGet(key);
+    const activeRow = await kvGet(activeKey);
+    const active = normalizeListenSession(payload(activeRow));
+    const useActive =
+      !!activeRow &&
+      active.sessionId === sessionId;
+
+    const row = useActive
+      ? activeRow
+      : await kvGet(historyKey);
     const current = normalizeListenSession(payload(row));
 
-    if (!row || current.sessionId !== sessionId) {
-      throw new Error('listen_session_not_active');
+    if (
+      !row ||
+      current.playerId !== playerId ||
+      current.sessionId !== sessionId
+    ) {
+      throw new Error('listen_session_not_found');
     }
 
     if (current.status === 'completed') {
@@ -4713,8 +4726,8 @@ async function actionListenSessionComplete(event, body) {
       };
     }
 
-    if (current.status !== 'active') {
-      throw new Error('listen_session_not_active');
+    if (!['active', 'replaced'].includes(current.status)) {
+      throw new Error('listen_session_not_completable');
     }
 
     const at = now();
@@ -4745,16 +4758,25 @@ async function actionListenSessionComplete(event, body) {
       updatedAt: at
     });
 
-    if (!await kvCompareAndPut({
+    const changed = await kvCompareAndPut({
       row,
-      type: 'listenActive',
+      type: useActive
+        ? 'listenActive'
+        : 'listenSession',
       owner: playerId,
+      expiresAt: useActive
+        ? 0
+        : num(row.expires_at) ||
+          at + LISTEN_SESSION_RETENTION_MS,
       data: completed
-    })) {
-      continue;
+    });
+
+    if (!changed) continue;
+
+    if (useActive) {
+      await persistListenSession(completed);
     }
 
-    await persistListenSession(completed);
     const finalized = await finalizeListenSession(completed);
 
     return {
