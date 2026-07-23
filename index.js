@@ -4785,14 +4785,12 @@ async function actionAchievementRewardStatus(event, body) {
       configured: LISTEN_TRACK_CATALOG.size > 0,
       tracks: LISTEN_TRACK_CATALOG.size,
       rewards: ACHIEVEMENT_REWARD_CATALOG.length,
-      rewardItems: ACHIEVEMENT_REWARD_CATALOG.map(item => ({
-        id: item.id,
-        metric: item.metric,
-        target: item.target,
-        amount: item.amount,
-        album: item.album || '',
-        validatorVersion: item.validatorVersion
-      }))
+      rewardItems: publicAchievementRewardItems({
+        playerId,
+        progress,
+        favoriteState,
+        wallet: rewards.wallet
+      })
     },
     activeSession:
       active.playerId === playerId &&
@@ -5086,6 +5084,18 @@ async function ensureRegistrationShardGrant(playerId) {
 
   throw new Error('wallet_registration_grant_conflict');
 }
+function achievementRewardOperationId(
+  playerId,
+  achievementId
+) {
+  return [
+    'grant',
+    'achievement',
+    sanitizeId(achievementId, 120),
+    sanitizeId(playerId, 96)
+  ].join(':');
+}
+
 async function applyAchievementShardGrant({
   playerId,
   achievementId,
@@ -5094,12 +5104,10 @@ async function applyAchievementShardGrant({
 }) {
   const cleanId = sanitizeId(achievementId, 120);
   const reward = Math.max(0, Math.floor(num(amount)));
-  const operationId = [
-    'grant',
-    'achievement',
-    cleanId,
-    sanitizeId(playerId, 96)
-  ].join(':');
+  const operationId = achievementRewardOperationId(
+    playerId,
+    cleanId
+  );
 
   if (!cleanId || !reward) {
     throw new Error('achievement_reward_invalid');
@@ -5217,10 +5225,49 @@ function achievementMetricValue(
   return 0;
 }
 
-async function reconcileAchievementRewards(
+function achievementRewardEnabled(reward) {
+  return reward.metric === 'favCount'
+    ? !CFG.favoriteRewardsShadow
+    : !CFG.listeningReceiptsShadow;
+}
+
+function publicAchievementRewardItems({
   playerId,
-  progressRaw
-) {
+  progress,
+  favoriteState,
+  wallet
+}) {
+  const grantIds = new Set(
+    Array.isArray(wallet?.grantIds)
+      ? wallet.grantIds
+      : []
+  );
+
+  return ACHIEVEMENT_REWARD_CATALOG.map(reward => {
+    const current = achievementMetricValue(
+      progress,
+      reward,
+      { favoriteState }
+    );
+    const operationId = achievementRewardOperationId(
+      playerId,
+      reward.id
+    );
+
+    return {
+      id: reward.id,
+      metric: reward.metric,
+      target: reward.target,
+      current,
+      amount: reward.amount,
+      album: reward.album || '',
+      validatorVersion: reward.validatorVersion,
+      eligible: current >= reward.target,
+      awarded: grantIds.has(operationId),
+      rewardsEnabled: achievementRewardEnabled(reward)
+    };
+  });
+}
   const progress = normalizeAchievementProgress(
     progressRaw,
     playerId
