@@ -386,10 +386,12 @@ const buildScaledRewards = ({
   metric,
   targets,
   xpBase,
-  xpMultiplier
+  xpMultiplier,
+  channel = 'listening'
 }) => targets.map((target, index) => ({
   id: `${id}_${index + 1}`,
   metric,
+  channel,
   target,
   amount: Math.floor(
     xpBase * Math.pow(xpMultiplier, index)
@@ -443,13 +445,23 @@ const ACHIEVEMENT_REWARD_CATALOG = Object.freeze([
   ...buildScaledRewards({
     id: 'fav_total',
     metric: 'favCount',
+    channel: 'favorite',
     targets: [3, 5, 8, 15, 50],
     xpBase: 10,
     xpMultiplier: 1.4
   }),
+  ...buildScaledRewards({
+    id: 'backup_saves',
+    metric: 'backupSaves',
+    channel: 'backup',
+    targets: [1, 3, 10],
+    xpBase: 20,
+    xpMultiplier: 1.5
+  }),
   ...[...LISTEN_ALBUM_TRACKS.keys()].map(album => ({
     id: `album_complete_${album}`,
     metric: 'albumComplete',
+    channel: 'listening',
     album,
     target: 1,
     amount: 150,
@@ -4013,6 +4025,10 @@ function normalizeAchievementProgress(raw = {}, playerId = '') {
       0,
       Math.floor(num(raw.totalSec))
     ),
+    backupSaves: Math.max(
+      0,
+      Math.floor(num(raw.backupSaves))
+    ),
     uniqueTracks: Object.fromEntries(
       Object.entries(uniqueTracks)
         .map(([uid, at]) => [
@@ -4043,6 +4059,13 @@ function normalizeAchievementProgress(raw = {}, playerId = '') {
         .map(value => sanitizeId(value, 120))
         .filter(Boolean)
     )].slice(-LISTEN_PROGRESS_RECEIPT_LIMIT),
+    backupReceiptIds: [...new Set(
+      (Array.isArray(raw.backupReceiptIds)
+        ? raw.backupReceiptIds
+        : [])
+        .map(value => sanitizeId(value, 120))
+        .filter(Boolean)
+    )].slice(-1000),
     updatedAt: num(raw.updatedAt)
   };
 }
@@ -4107,6 +4130,7 @@ function publicAchievementProgress(progress) {
     validPlays: data.validPlays,
     fullPlays: data.fullPlays,
     totalSec: data.totalSec,
+    backupSaves: data.backupSaves,
     uniqueTracks: Object.keys(data.uniqueTracks).length,
     maxOneTrackFull: Math.max(
       0,
@@ -4804,6 +4828,120 @@ async function actionListenSessionComplete(event, body) {
   throw new Error('listen_session_complete_conflict');
 }
 
+async function actionBackupAchievementReceipt(event, body) {
+  const secret = headerValue(
+    event,
+    'x-vi3-backup-secret'
+  );
+
+  if (
+    !CFG.backupReceiptSecret ||
+    !timingSafeEqualText(
+      secret,
+      CFG.backupReceiptSecret
+    )
+  ) {
+    throw new Error('bad_backup_receipt_secret');
+  }
+
+  const ownerYandexId = safe(body.ownerYandexId);
+  const payloadHash = safe(body.payloadHash).toLowerCase();
+
+  if (
+    !ownerYandexId ||
+    !/^[a-f0-9]{64}$/.test(payloadHash)
+  ) {
+    throw new Error('bad_backup_receipt');
+  }
+
+  const playerId = makeFriendId(ownerYandexId);
+  const receiptId = `backup_${hash(
+    `${ownerYandexId}:${payloadHash}`
+  ).slice(0, 40)}`;
+  const key = achievementProgressKey(playerId);
+
+  for (let attempt = 0; attempt < 10; attempt++) {
+    let row = await kvGet(key);
+
+    if (!row) {
+      try {
+        await kvInsert({
+          pk: key,
+          type: 'achievementProgress',
+          owner: playerId,
+          data: normalizeAchievementProgress(
+            {},
+            playerId
+          )
+        });
+      } catch {}
+
+      row = await kvGet(key);
+      if (!row) continue;
+    }
+
+    const progress = normalizeAchievementProgress(
+      payload(row),
+      playerId
+    );
+
+    if (progress.backupReceiptIds.includes(receiptId)) {
+      const rewards = await reconcileAchievementRewards(
+        playerId,
+        progress
+      );
+
+      return {
+        ok: true,
+        duplicate: true,
+        receiptId,
+        shadow: CFG.backupRewardsShadow,
+        rewardsEnabled: !CFG.backupRewardsShadow,
+        rewards: rewards.grants,
+        wallet: publicShardWallet(rewards.wallet),
+        progress: publicAchievementProgress(progress)
+      };
+    }
+
+    const next = normalizeAchievementProgress({
+      ...progress,
+      backupSaves: progress.backupSaves + 1,
+      backupReceiptIds: [
+        ...progress.backupReceiptIds,
+        receiptId
+      ],
+      updatedAt: now()
+    }, playerId);
+
+    if (!await kvCompareAndPut({
+      row,
+      type: 'achievementProgress',
+      owner: playerId,
+      data: next
+    })) {
+      continue;
+    }
+
+    const rewards = await reconcileAchievementRewards(
+      playerId,
+      next
+    );
+
+    return {
+      ok: true,
+      duplicate: false,
+      receiptId,
+      shadow: CFG.backupRewardsShadow,
+      rewardsEnabled: !CFG.backupRewardsShadow,
+      rewards: rewards.grants,
+      wallet: publicShardWallet(rewards.wallet),
+      progress: publicAchievementProgress(next)
+    };
+  }
+
+  throw new Error('backup_receipt_conflict');
+}
+
 async function actionAchievementRewardStatus(event, body) {
   const { playerId } = await requirePlayer(event, body);
   const active = normalizeListenSession(
@@ -5265,6 +5403,13 @@ function achievementMetricValue(
     );
   }
 
+  if (reward.metric === 'backupSaves') {
+    return Math.max(
+      0,
+      Math.floor(num(progress.backupSaves))
+    );
+  }
+
   if (reward.metric === 'albumComplete') {
     const tracks = LISTEN_ALBUM_TRACKS.get(
       reward.album
@@ -5282,9 +5427,15 @@ function achievementMetricValue(
 }
 
 function achievementRewardEnabled(reward) {
-  return reward.metric === 'favCount'
-    ? !CFG.favoriteRewardsShadow
-    : !CFG.listeningReceiptsShadow;
+  if (reward.channel === 'favorite') {
+    return !CFG.favoriteRewardsShadow;
+  }
+
+  if (reward.channel === 'backup') {
+    return !CFG.backupRewardsShadow;
+  }
+
+  return !CFG.listeningReceiptsShadow;
 }
 
 function publicAchievementRewardItems({
@@ -5313,6 +5464,7 @@ function publicAchievementRewardItems({
     return {
       id: reward.id,
       metric: reward.metric,
+      channel: reward.channel || 'listening',
       target: reward.target,
       current,
       amount: reward.amount,
@@ -5344,20 +5496,7 @@ async function reconcileAchievementRewards(
   );
 
   for (const reward of ACHIEVEMENT_REWARD_CATALOG) {
-    const favoriteMetric =
-      reward.metric === 'favCount';
-
-    if (
-      favoriteMetric &&
-      CFG.favoriteRewardsShadow
-    ) {
-      continue;
-    }
-
-    if (
-      !favoriteMetric &&
-      CFG.listeningReceiptsShadow
-    ) {
+    if (!achievementRewardEnabled(reward)) {
       continue;
     }
 
@@ -5399,7 +5538,8 @@ async function reconcileAchievementRewards(
   return {
     enabled:
       !CFG.listeningReceiptsShadow ||
-      !CFG.favoriteRewardsShadow,
+      !CFG.favoriteRewardsShadow ||
+      !CFG.backupRewardsShadow,
     grants,
     wallet: latestWallet
   };
@@ -8527,6 +8667,8 @@ const ACTIONS = {
   listen_session_complete: actionListenSessionComplete,
   achievement_reward_status:
     actionAchievementRewardStatus,
+  backup_achievement_receipt:
+    actionBackupAchievementReceipt,
   rtc_config: actionRtcConfig,
   webpush_config: actionWebPushConfig,
   webpush_subscribe: actionWebPushSubscribe,
@@ -8615,6 +8757,12 @@ exports.handler = async event => {
             CFG.favoriteRewardsShadow,
           catalogTracks:
             LISTEN_TRACK_CATALOG.size
+        },
+        backupRewards: {
+          enabled: true,
+          shadow: CFG.backupRewardsShadow,
+          receiptSecretConfigured:
+            !!CFG.backupReceiptSecret
         },
         ts: now()
       });
