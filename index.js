@@ -4777,9 +4777,11 @@ async function actionAchievementRewardStatus(event, body) {
     ok: true,
     shadow: CFG.listeningReceiptsShadow,
     rewardsEnabled: !CFG.listeningReceiptsShadow,
-    conversion: {
-      xpToShards: 1,
-      rule: '1_xp_equals_1_shard'
+    currency: {
+      code: 'shards',
+      symbol: '♦',
+      rewardPolicy: 'server_catalog',
+      legacyNominalMigrated: true
     },
     catalog: {
       configured: LISTEN_TRACK_CATALOG.size > 0,
