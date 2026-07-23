@@ -4784,7 +4784,15 @@ async function actionAchievementRewardStatus(event, body) {
     catalog: {
       configured: LISTEN_TRACK_CATALOG.size > 0,
       tracks: LISTEN_TRACK_CATALOG.size,
-      rewards: ACHIEVEMENT_REWARD_CATALOG.length
+      rewards: ACHIEVEMENT_REWARD_CATALOG.length,
+      rewardItems: ACHIEVEMENT_REWARD_CATALOG.map(item => ({
+        id: item.id,
+        metric: item.metric,
+        target: item.target,
+        amount: item.amount,
+        album: item.album || '',
+        validatorVersion: item.validatorVersion
+      }))
     },
     activeSession:
       active.playerId === playerId &&
