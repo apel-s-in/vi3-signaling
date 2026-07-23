@@ -64,6 +64,13 @@ const CFG = {
       180000
     )
   ),
+  listenBackgroundMaxGapMs: Math.max(
+    180000,
+    Math.min(
+      num(process.env.LISTEN_BACKGROUND_MAX_GAP_MS, 900000),
+      1800000
+    )
+  ),
   listenSessionMaxMs: Math.max(
     10 * 60 * 1000,
     Math.min(
@@ -4148,9 +4155,23 @@ function applyListenObservation(
     0,
     at - current.lastHeartbeatAt
   );
-  const gapSec = gapMs / 1000;
   const positionDelta =
     position - current.lastPosition;
+  const mediaDeltaMs = positionDelta * 1000;
+  const visibility = sanitizeId(
+    body.visibility,
+    20
+  );
+  const background =
+    visibility === 'hidden' ||
+    current.visibility === 'hidden';
+  const maxGapMs = background
+    ? CFG.listenBackgroundMaxGapMs
+    : CFG.listenHeartbeatMaxGapMs;
+  const forwardToleranceMs = Math.max(
+    5000,
+    gapMs * 0.2
+  );
 
   if (
     !completed &&
@@ -4169,13 +4190,18 @@ function applyListenObservation(
   if (gapMs <= 0) {
     accepted = false;
     rejectReason = 'clock';
-  } else if (gapMs > CFG.listenHeartbeatMaxGapMs) {
+  } else if (gapMs > maxGapMs) {
     accepted = false;
-    rejectReason = 'heartbeat_gap';
+    rejectReason = background
+      ? 'background_gap'
+      : 'heartbeat_gap';
   } else if (positionDelta < -2) {
     accepted = false;
     rejectReason = 'position_rewind';
-  } else if (positionDelta > gapSec + 5) {
+  } else if (
+    mediaDeltaMs >
+    gapMs + forwardToleranceMs
+  ) {
     accepted = false;
     rejectReason = 'position_jump';
   }
@@ -4183,10 +4209,12 @@ function applyListenObservation(
   const creditMs = accepted
     ? Math.max(
         0,
-        Math.min(
-          gapMs,
-          Math.max(0, positionDelta * 1000 + 1500),
-          CFG.listenHeartbeatMaxGapMs
+        Math.floor(
+          Math.min(
+            gapMs,
+            mediaDeltaMs,
+            maxGapMs
+          )
         )
       )
     : 0;
@@ -8545,7 +8573,15 @@ exports.handler = async event => {
           catalogConfigured:
             LISTEN_TRACK_CATALOG.size > 0,
           catalogTracks:
-            LISTEN_TRACK_CATALOG.size
+            LISTEN_TRACK_CATALOG.size,
+          heartbeatMinMs:
+            CFG.listenHeartbeatMinMs,
+          heartbeatMaxGapMs:
+            CFG.listenHeartbeatMaxGapMs,
+          backgroundMaxGapMs:
+            CFG.listenBackgroundMaxGapMs,
+          sessionMaxMs:
+            CFG.listenSessionMaxMs
         },
         favoriteMirror: {
           enabled: true,
