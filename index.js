@@ -50,6 +50,10 @@ const CFG = {
     safe(process.env.LISTENING_RECEIPTS_SHADOW || '1') === '1',
   favoriteRewardsShadow:
     safe(process.env.FAVORITE_REWARDS_SHADOW || '1') === '1',
+  backupRewardsShadow:
+    safe(process.env.BACKUP_REWARDS_SHADOW || '1') === '1',
+  backupReceiptSecret:
+    safe(process.env.BACKUP_RECEIPT_SECRET || ''),
   listenHeartbeatMinMs: Math.max(
     5000,
     Math.min(
