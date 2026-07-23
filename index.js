@@ -5268,6 +5268,11 @@ function publicAchievementRewardItems({
     };
   });
 }
+
+async function reconcileAchievementRewards(
+  playerId,
+  progressRaw
+) {
   const progress = normalizeAchievementProgress(
     progressRaw,
     playerId
