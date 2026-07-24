@@ -4078,11 +4078,35 @@ function listenTrackFromCatalog(trackUid) {
   return track;
 }
 
+function hasOwn(object, key) {
+  return Object.prototype.hasOwnProperty.call(
+    object || {},
+    key
+  );
+}
+
 function normalizeListenQuality(value) {
   const quality = safe(value).toLowerCase();
   return ['hi', 'lo'].includes(quality)
     ? quality
     : '';
+}
+
+function listenContextVersion(body = {}) {
+  const timezone = Number(body.timezoneOffsetMin);
+
+  return (
+    !!normalizeListenQuality(body.quality) &&
+    Number.isFinite(timezone) &&
+    timezone >= -840 &&
+    timezone <= 840 &&
+    hasOwn(body, 'shuffle') &&
+    typeof body.shuffle === 'boolean' &&
+    hasOwn(body, 'favoritesOnly') &&
+    typeof body.favoritesOnly === 'boolean'
+  )
+    ? 1
+    : 0;
 }
 
 function normalizeTimezoneOffsetMin(value) {
@@ -4122,6 +4146,10 @@ function normalizeListenSession(raw = {}) {
       Math.min(7200, num(raw.duration))
     ),
     variant: sanitizeId(raw.variant || 'audio', 40),
+    contextVersion: Math.max(
+      0,
+      Math.min(1, Math.floor(num(raw.contextVersion)))
+    ),
     quality: normalizeListenQuality(raw.quality),
     timezoneOffsetMin:
       normalizeTimezoneOffsetMin(raw.timezoneOffsetMin),
@@ -4292,6 +4320,7 @@ function publicListenSession(session) {
     sessionId: data.sessionId,
     trackUid: data.trackUid,
     status: data.status,
+    contextVersion: data.contextVersion,
     quality: data.quality,
     timezoneOffsetMin: data.timezoneOffsetMin,
     shuffle: data.shuffle,
@@ -4411,8 +4440,19 @@ function applyListenObservation(
 
   let accepted = true;
   let rejectReason = '';
+  const muted = body.muted === true;
+  const volume = Number(body.volume);
+  const inaudible =
+    muted ||
+    (
+      Number.isFinite(volume) &&
+      volume <= 0
+    );
 
-  if (gapMs <= 0) {
+  if (inaudible) {
+    accepted = false;
+    rejectReason = 'inaudible';
+  } else if (gapMs <= 0) {
     accepted = false;
     rejectReason = 'clock';
   } else if (gapMs > maxGapMs) {
@@ -4521,27 +4561,36 @@ async function applyListenReceiptProgress(receipt) {
       ...progress.perTrackFull
     };
     const activeDays = [...progress.activeDays];
-    const localStart = listenLocalParts(
-      receipt.startedAt,
-      receipt.timezoneOffsetMin
-    );
-    const localMinute =
-      localStart.hour * 60 + localStart.minute;
+    const contextValid =
+      Math.floor(num(receipt.contextVersion)) >= 1;
+    const localStart = contextValid
+      ? listenLocalParts(
+          receipt.startedAt,
+          receipt.timezoneOffsetMin
+        )
+      : null;
+    const localMinute = localStart
+      ? localStart.hour * 60 + localStart.minute
+      : -1;
     const earlyFull =
+      contextValid &&
       receipt.full &&
       localMinute >= 300 &&
       localMinute <= 539;
     const nightFull =
+      contextValid &&
       receipt.full &&
       localMinute >= 120 &&
       localMinute <= 270;
     const weekendValid =
+      contextValid &&
       receipt.valid &&
       (
         localStart.weekday === 0 ||
         localStart.weekday === 6
       );
     const exactStart1111 =
+      contextValid &&
       receipt.valid &&
       localMinute === 671;
 
@@ -4576,6 +4625,7 @@ async function applyListenReceiptProgress(receipt) {
       hiFullPlays:
         progress.hiFullPlays +
         (
+          contextValid &&
           receipt.full &&
           receipt.quality === 'hi'
             ? 1
@@ -4593,6 +4643,7 @@ async function applyListenReceiptProgress(receipt) {
       shuffleFullPlays:
         progress.shuffleFullPlays +
         (
+          contextValid &&
           receipt.full &&
           receipt.shuffle === true
             ? 1
@@ -4676,6 +4727,7 @@ async function finalizeListenSession(session) {
     acceptedHeartbeats: data.acceptedHeartbeats,
     rejectedHeartbeats: data.rejectedHeartbeats,
     completionReason: data.completionReason,
+    contextVersion: data.contextVersion,
     quality: data.quality,
     timezoneOffsetMin: data.timezoneOffsetMin,
     shuffle: data.shuffle,
@@ -4820,6 +4872,7 @@ async function actionListenSessionStart(event, body) {
       album: track.album,
       duration: track.duration,
       variant: body.variant || 'audio',
+      contextVersion: listenContextVersion(body),
       quality: body.quality || '',
       timezoneOffsetMin: body.timezoneOffsetMin,
       shuffle: body.shuffle === true,
@@ -5010,6 +5063,7 @@ async function actionListenSessionComplete(event, body) {
         duplicate: true,
         shadow: CFG.listeningReceiptsShadow,
         rewardsEnabled: !CFG.listeningReceiptsShadow,
+        rewardChannels: publicRewardChannels(),
         receipt: finalized.receipt,
         rewards: finalized.rewards?.grants || [],
         wallet: finalized.rewards?.wallet
@@ -5081,6 +5135,7 @@ async function actionListenSessionComplete(event, body) {
         observation.accepted === true,
       shadow: CFG.listeningReceiptsShadow,
       rewardsEnabled: !CFG.listeningReceiptsShadow,
+      rewardChannels: publicRewardChannels(),
       receipt: finalized.receipt,
       rewards: finalized.rewards?.grants || [],
       wallet: finalized.rewards?.wallet
@@ -5266,6 +5321,7 @@ async function actionAchievementRewardStatus(event, body) {
     ok: true,
     shadow: CFG.listeningReceiptsShadow,
     rewardsEnabled: !CFG.listeningReceiptsShadow,
+    rewardChannels: publicRewardChannels(),
     currency: {
       code: 'shards',
       symbol: '♦',
@@ -5747,6 +5803,28 @@ function achievementMetricValue(
   }
 
   return 0;
+}
+
+function publicRewardChannels() {
+  return {
+    listening: {
+      shadow: CFG.listeningReceiptsShadow,
+      rewardsEnabled: !CFG.listeningReceiptsShadow
+    },
+    listeningContext: {
+      shadow: CFG.listeningContextRewardsShadow,
+      rewardsEnabled:
+        !CFG.listeningContextRewardsShadow
+    },
+    favorite: {
+      shadow: CFG.favoriteRewardsShadow,
+      rewardsEnabled: !CFG.favoriteRewardsShadow
+    },
+    backup: {
+      shadow: CFG.backupRewardsShadow,
+      rewardsEnabled: !CFG.backupRewardsShadow
+    }
+  };
 }
 
 function achievementRewardEnabled(reward) {
