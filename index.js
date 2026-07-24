@@ -524,6 +524,22 @@ const ACHIEVEMENT_REWARD_CATALOG = Object.freeze([
     amount: 200,
     validatorVersion: 1
   },
+  {
+    id: 'midnight_triple',
+    metric: 'midnightTriple',
+    channel: 'listening_context',
+    target: 1,
+    amount: 400,
+    validatorVersion: 1
+  },
+  {
+    id: 'speed_runner',
+    metric: 'speedRunnerObservedMs',
+    channel: 'listening',
+    target: 10800000,
+    amount: 300,
+    validatorVersion: 1
+  },
   ...[...LISTEN_ALBUM_TRACKS.keys()].map(album => ({
     id: `album_complete_${album}`,
     metric: 'albumComplete',
@@ -4172,6 +4188,23 @@ function normalizeListenSession(raw = {}) {
     shuffle: raw.shuffle === true,
     favoritesOnly: raw.favoritesOnly === true,
     favoriteAtStart: raw.favoriteAtStart === true,
+    favoriteRevisionAtStart: Math.max(
+      0,
+      Math.floor(num(raw.favoriteRevisionAtStart))
+    ),
+    favoriteOrderIndexAtStart: Math.max(
+      -1,
+      Math.floor(num(raw.favoriteOrderIndexAtStart, -1))
+    ),
+    favoriteOrderSizeAtStart: Math.max(
+      0,
+      Math.floor(num(raw.favoriteOrderSizeAtStart))
+    ),
+    continuousObservedMs: Math.max(
+      0,
+      Math.floor(num(raw.continuousObservedMs))
+    ),
+    continuityBroken: raw.continuityBroken === true,
     status: sanitizeId(raw.status || 'active', 30),
     startedAt: num(raw.startedAt),
     lastHeartbeatAt: num(raw.lastHeartbeatAt),
@@ -4220,6 +4253,18 @@ function normalizeFavoriteOrderedByDevice(raw = {}) {
               0,
               Math.min(5, Math.floor(num(value?.count)))
             ),
+            revision: Math.max(
+              0,
+              Math.floor(num(value?.revision))
+            ),
+            orderSize: Math.max(
+              0,
+              Math.floor(num(value?.orderSize))
+            ),
+            lastOrderIndex: Math.max(
+              -1,
+              Math.floor(num(value?.lastOrderIndex, -1))
+            ),
             lastTrackUid: sanitizeId(
               value?.lastTrackUid,
               160
@@ -4258,6 +4303,84 @@ function normalizeFavoriteShuffleByDevice(raw = {}) {
                 .map(uid => sanitizeId(uid, 160))
                 .filter(Boolean)
             )].slice(-5),
+            updatedAt: Math.max(0, num(value?.updatedAt))
+          }
+        ];
+      })
+      .filter(Boolean)
+      .sort((left, right) =>
+        num(left[1].updatedAt) - num(right[1].updatedAt)
+      )
+      .slice(-30)
+  );
+}
+
+function normalizeMidnightTripleByDevice(raw = {}) {
+  const source =
+    raw && typeof raw === 'object' && !Array.isArray(raw)
+      ? raw
+      : {};
+
+  return Object.fromEntries(
+    Object.entries(source)
+      .map(([deviceId, value]) => {
+        const id = sanitizeId(deviceId, 120);
+        if (!id) return null;
+
+        return [
+          id,
+          {
+            trackUid: sanitizeId(value?.trackUid, 160),
+            count: Math.max(
+              0,
+              Math.min(3, Math.floor(num(value?.count)))
+            ),
+            lastCompletedAt: Math.max(
+              0,
+              num(value?.lastCompletedAt)
+            ),
+            updatedAt: Math.max(0, num(value?.updatedAt))
+          }
+        ];
+      })
+      .filter(Boolean)
+      .sort((left, right) =>
+        num(left[1].updatedAt) - num(right[1].updatedAt)
+      )
+      .slice(-30)
+  );
+}
+
+function normalizeSpeedRunnerByDevice(raw = {}) {
+  const source =
+    raw && typeof raw === 'object' && !Array.isArray(raw)
+      ? raw
+      : {};
+
+  return Object.fromEntries(
+    Object.entries(source)
+      .map(([deviceId, value]) => {
+        const id = sanitizeId(deviceId, 120);
+        if (!id) return null;
+
+        return [
+          id,
+          {
+            runMs: Math.max(
+              0,
+              Math.min(
+                10800000,
+                Math.floor(num(value?.runMs))
+              )
+            ),
+            lastTrackUid: sanitizeId(
+              value?.lastTrackUid,
+              160
+            ),
+            lastCompletedAt: Math.max(
+              0,
+              num(value?.lastCompletedAt)
+            ),
             updatedAt: Math.max(0, num(value?.updatedAt))
           }
         ];
@@ -4350,6 +4473,25 @@ function normalizeAchievementProgress(raw = {}, playerId = '') {
       normalizeFavoriteShuffleByDevice(
         raw.favoriteShuffleByDevice
       ),
+    midnightTriple: Math.max(
+      0,
+      Math.min(1, Math.floor(num(raw.midnightTriple)))
+    ),
+    midnightTripleByDevice:
+      normalizeMidnightTripleByDevice(
+        raw.midnightTripleByDevice
+      ),
+    speedRunnerObservedMs: Math.max(
+      0,
+      Math.min(
+        10800000,
+        Math.floor(num(raw.speedRunnerObservedMs))
+      )
+    ),
+    speedRunnerByDevice:
+      normalizeSpeedRunnerByDevice(
+        raw.speedRunnerByDevice
+      ),
     uniqueTracks: Object.fromEntries(
       Object.entries(uniqueTracks)
         .map(([uid, at]) => [
@@ -4404,26 +4546,34 @@ function utcDayKey(timestamp) {
     .slice(0, 10);
 }
 
-function calculateServerStreak(days = []) {
+function calculateServerStreakSummary(days = []) {
   const values = [...new Set(days)]
     .filter(value => /^\d{4}-\d{2}-\d{2}$/.test(value))
     .sort();
 
-  if (!values.length) return 0;
+  let current = 0;
+  let longest = 0;
+  let run = 0;
+  let previous = 0;
 
-  let streak = 1;
+  values.forEach(value => {
+    const timestamp = Date.parse(`${value}T00:00:00Z`);
 
-  for (let index = values.length - 1; index > 0; index--) {
-    const current = Date.parse(`${values[index]}T00:00:00Z`);
-    const previous = Date.parse(
-      `${values[index - 1]}T00:00:00Z`
-    );
+    run = previous && timestamp - previous === 86400000
+      ? run + 1
+      : 1;
 
-    if (current - previous !== 86400000) break;
-    streak++;
-  }
+    current = run;
+    longest = Math.max(longest, run);
+    previous = timestamp;
+  });
 
-  return streak;
+  return {
+    current,
+    longest,
+    lastActiveDate: values[values.length - 1] || '',
+    activeDays: values.length
+  };
 }
 
 function publicListenSession(session) {
@@ -4432,6 +4582,7 @@ function publicListenSession(session) {
   return {
     version: data.version,
     sessionId: data.sessionId,
+    deviceId: data.deviceId,
     trackUid: data.trackUid,
     status: data.status,
     contextVersion: data.contextVersion,
@@ -4440,6 +4591,13 @@ function publicListenSession(session) {
     shuffle: data.shuffle,
     favoritesOnly: data.favoritesOnly,
     favoriteAtStart: data.favoriteAtStart,
+    favoriteRevisionAtStart: data.favoriteRevisionAtStart,
+    favoriteOrderIndexAtStart: data.favoriteOrderIndexAtStart,
+    favoriteOrderSizeAtStart: data.favoriteOrderSizeAtStart,
+    continuousObservedSec: Math.floor(
+      data.continuousObservedMs / 1000
+    ),
+    continuityBroken: data.continuityBroken,
     startedAt: data.startedAt,
     lastHeartbeatAt: data.lastHeartbeatAt,
     completedAt: data.completedAt,
@@ -4455,6 +4613,9 @@ function publicAchievementProgress(progress) {
   const data = normalizeAchievementProgress(
     progress,
     progress?.playerId
+  );
+  const streak = calculateServerStreakSummary(
+    data.activeDaysLocal
   );
 
   return {
@@ -4479,15 +4640,25 @@ function publicAchievementProgress(progress) {
       Object.keys(data.favoriteOrderedByDevice).length,
     activeFavoriteShuffleDevices:
       Object.keys(data.favoriteShuffleByDevice).length,
+    midnightTriple: data.midnightTriple,
+    activeMidnightTripleDevices:
+      Object.keys(data.midnightTripleByDevice).length,
+    speedRunnerObservedMs:
+      data.speedRunnerObservedMs,
+    speedRunnerObservedSec:
+      Math.floor(data.speedRunnerObservedMs / 1000),
+    activeSpeedRunnerDevices:
+      Object.keys(data.speedRunnerByDevice).length,
     uniqueTracks: Object.keys(data.uniqueTracks).length,
     maxOneTrackFull: Math.max(
       0,
       ...Object.values(data.perTrackFull)
     ),
-    streak: calculateServerStreak(
-      data.activeDaysLocal
-    ),
-    activeDays: data.activeDaysLocal.length,
+    streak: streak.longest,
+    currentStreak: streak.current,
+    longestStreak: streak.longest,
+    activeDays: streak.activeDays,
+    streakLastActiveDate: streak.lastActiveDate,
     legacyUtcActiveDays: data.activeDays.length,
     streakDayMode: 'local_session_start_v1',
     receipts: data.receiptIds.length,
@@ -4623,6 +4794,11 @@ function applyListenObservation(
       // каждый следующий heartbeat будет сравниваться со старой позицией.
       lastPosition: position,
       observedMs: current.observedMs + creditMs,
+      continuousObservedMs: accepted
+        ? current.continuousObservedMs + creditMs
+        : 0,
+      continuityBroken:
+        current.continuityBroken || !accepted,
       acceptedHeartbeats:
         current.acceptedHeartbeats +
         (accepted ? 1 : 0),
@@ -4696,6 +4872,12 @@ async function applyListenReceiptProgress(receipt) {
     const favoriteShuffleByDevice = {
       ...progress.favoriteShuffleByDevice
     };
+    const midnightTripleByDevice = {
+      ...progress.midnightTripleByDevice
+    };
+    const speedRunnerByDevice = {
+      ...progress.speedRunnerByDevice
+    };
     const contextValid =
       Math.floor(num(receipt.contextVersion)) >= 1;
     const localStart = contextValid
@@ -4744,25 +4926,62 @@ async function applyListenReceiptProgress(receipt) {
       progress.favoriteOrderedFullRun;
     let shuffleRun =
       progress.favoriteShuffleUniqueRun;
+    let midnightTriple =
+      progress.midnightTriple;
+    let speedRunnerObservedMs =
+      progress.speedRunnerObservedMs;
 
     if (deviceId) {
-      if (
+      const favoriteRevision = Math.max(
+        0,
+        Math.floor(num(receipt.favoriteRevisionAtStart))
+      );
+      const favoriteOrderIndex = Math.max(
+        -1,
+        Math.floor(num(receipt.favoriteOrderIndexAtStart, -1))
+      );
+      const favoriteOrderSize = Math.max(
+        0,
+        Math.floor(num(receipt.favoriteOrderSizeAtStart))
+      );
+      const orderedEligible =
         favoriteSequenceEligible &&
-        receipt.shuffle !== true
-      ) {
+        receipt.shuffle !== true &&
+        favoriteRevision > 0 &&
+        favoriteOrderSize >= 5 &&
+        favoriteOrderIndex >= 0 &&
+        favoriteOrderIndex < favoriteOrderSize;
+
+      if (orderedEligible) {
         const previous =
           favoriteOrderedByDevice[deviceId] || {
             count: 0,
+            revision: 0,
+            orderSize: 0,
+            lastOrderIndex: -1,
             lastTrackUid: ''
           };
-
-        const count =
-          previous.lastTrackUid === receipt.trackUid
-            ? previous.count
-            : Math.min(5, previous.count + 1);
+        const expectedIndex =
+          previous.orderSize > 0
+            ? (
+                previous.lastOrderIndex + 1
+              ) % previous.orderSize
+            : -1;
+        const continues =
+          previous.count > 0 &&
+          previous.revision === favoriteRevision &&
+          previous.orderSize === favoriteOrderSize &&
+          expectedIndex === favoriteOrderIndex &&
+          previous.lastTrackUid !== receipt.trackUid;
+        const count = continues
+          ? Math.min(5, previous.count + 1)
+          : 1;
 
         favoriteOrderedByDevice[deviceId] = {
           count,
+          revision: favoriteRevision,
+          orderSize: favoriteOrderSize,
+          lastOrderIndex: favoriteOrderIndex,
           lastTrackUid: receipt.trackUid,
           updatedAt: receipt.completedAt
         };
@@ -4777,7 +4996,6 @@ async function applyListenReceiptProgress(receipt) {
           favoriteShuffleByDevice[deviceId] || {
             trackUids: []
           };
-
         const trackUids = [...new Set([
           ...(previous.trackUids || []),
           receipt.trackUid
@@ -4794,10 +5012,91 @@ async function applyListenReceiptProgress(receipt) {
           trackUids.length
         );
       } else {
-        // Pause, Stop, Skip, account switch, неполное прослушивание
-        // или выход из Favorites Only сбрасывают только это устройство.
         delete favoriteOrderedByDevice[deviceId];
         delete favoriteShuffleByDevice[deviceId];
+      }
+
+      const midnightEligible =
+        contextValid &&
+        receipt.full === true &&
+        receipt.completionReason === 'ended' &&
+        localMinute >= 0 &&
+        localMinute <= 30;
+
+      if (midnightEligible) {
+        const previous =
+          midnightTripleByDevice[deviceId] || {
+            trackUid: '',
+            count: 0,
+            lastCompletedAt: 0
+          };
+        const startGapMs =
+          num(receipt.startedAt) -
+          num(previous.lastCompletedAt);
+        const continues =
+          previous.trackUid === receipt.trackUid &&
+          startGapMs >= 0 &&
+          startGapMs <= 30000;
+        const count = continues
+          ? Math.min(3, previous.count + 1)
+          : 1;
+
+        midnightTripleByDevice[deviceId] = {
+          trackUid: receipt.trackUid,
+          count,
+          lastCompletedAt: receipt.completedAt,
+          updatedAt: receipt.completedAt
+        };
+
+        midnightTriple = Math.max(
+          midnightTriple,
+          count >= 3 ? 1 : 0
+        );
+      } else {
+        delete midnightTripleByDevice[deviceId];
+      }
+
+      const continuousTailMs = Math.max(
+        0,
+        Math.floor(num(receipt.continuousObservedMs))
+      );
+      const speedEligible =
+        receipt.completionReason === 'ended' &&
+        continuousTailMs > 0;
+
+      if (speedEligible) {
+        const previous =
+          speedRunnerByDevice[deviceId] || {
+            runMs: 0,
+            lastCompletedAt: 0
+          };
+        const startGapMs =
+          num(receipt.startedAt) -
+          num(previous.lastCompletedAt);
+        const continues =
+          receipt.continuityBroken !== true &&
+          previous.runMs > 0 &&
+          startGapMs >= 0 &&
+          startGapMs <= 30000;
+        const runMs = Math.min(
+          10800000,
+          (continues ? previous.runMs : 0) +
+            continuousTailMs
+        );
+
+        speedRunnerByDevice[deviceId] = {
+          runMs,
+          lastTrackUid: receipt.trackUid,
+          lastCompletedAt: receipt.completedAt,
+          updatedAt: receipt.completedAt
+        };
+
+        speedRunnerObservedMs = Math.max(
+          speedRunnerObservedMs,
+          runMs
+        );
+      } else {
+        delete speedRunnerByDevice[deviceId];
       }
     }
 
@@ -4878,6 +5177,10 @@ async function applyListenReceiptProgress(receipt) {
         shuffleRun,
       favoriteOrderedByDevice,
       favoriteShuffleByDevice,
+      midnightTriple,
+      midnightTripleByDevice,
+      speedRunnerObservedMs,
+      speedRunnerByDevice,
       uniqueTracks,
       perTrackFull,
       activeDays,
@@ -4959,6 +5262,16 @@ async function finalizeListenSession(session) {
     shuffle: data.shuffle,
     favoritesOnly: data.favoritesOnly,
     favoriteAtStart: data.favoriteAtStart,
+    favoriteRevisionAtStart:
+      data.favoriteRevisionAtStart,
+    favoriteOrderIndexAtStart:
+      data.favoriteOrderIndexAtStart,
+    favoriteOrderSizeAtStart:
+      data.favoriteOrderSizeAtStart,
+    continuousObservedMs:
+      data.continuousObservedMs,
+    continuityBroken:
+      data.continuityBroken,
     startedAt: data.startedAt,
     completedAt: data.completedAt,
     shadow: true,
@@ -5061,8 +5374,20 @@ async function actionListenSessionStart(event, body) {
     )),
     playerId
   );
+  const favoriteOrder = Object.values(
+    favoriteState.items || {}
+  )
+    .filter(item => item.status === 'active')
+    .sort((left, right) =>
+      num(left.addedAt) - num(right.addedAt) ||
+      left.uid.localeCompare(right.uid)
+    );
+  const favoriteOrderIndexAtStart =
+    favoriteOrder.findIndex(item =>
+      item.uid === track.uid
+    );
   const favoriteAtStart =
-    favoriteState.items?.[track.uid]?.status === 'active';
+    favoriteOrderIndexAtStart >= 0;
   const key = listenActiveKey(
     playerId,
     deviceId
@@ -5104,6 +5429,11 @@ async function actionListenSessionStart(event, body) {
       shuffle: body.shuffle === true,
       favoritesOnly: body.favoritesOnly === true,
       favoriteAtStart,
+      favoriteRevisionAtStart: favoriteState.revision,
+      favoriteOrderIndexAtStart,
+      favoriteOrderSizeAtStart: favoriteOrder.length,
+      continuousObservedMs: 0,
+      continuityBroken: false,
       status: 'active',
       startedAt: at,
       lastHeartbeatAt: at,
@@ -5976,9 +6306,9 @@ function achievementMetricValue(
   }
 
   if (reward.metric === 'streak') {
-    return calculateServerStreak(
+    return calculateServerStreakSummary(
       progress.activeDaysLocal
-    );
+    ).longest;
   }
   if (reward.metric === 'favCount') {
     return favoriteRewardCount(
@@ -6023,6 +6353,14 @@ function achievementMetricValue(
 
   if (reward.metric === 'favoriteShuffleUniqueRun') {
     return progress.favoriteShuffleUniqueRun;
+  }
+
+  if (reward.metric === 'midnightTriple') {
+    return progress.midnightTriple;
+  }
+
+  if (reward.metric === 'speedRunnerObservedMs') {
+    return progress.speedRunnerObservedMs;
   }
 
   if (reward.metric === 'albumComplete') {
@@ -9415,8 +9753,16 @@ exports.handler = async event => {
             'shuffleFullPlays',
             'exactStart1111',
             'favoriteOrderedFullRun',
-            'favoriteShuffleUniqueRun'
+            'favoriteShuffleUniqueRun',
+            'midnightTriple'
           ]
+        },
+        continuousListeningRewards: {
+          enabled: true,
+          shadow: CFG.listeningReceiptsShadow,
+          metric: 'speedRunnerObservedMs',
+          targetMs: 10800000,
+          transitionGapMs: 30000
         },
         backupRewards: {
           enabled: true,
