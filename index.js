@@ -48,6 +48,8 @@ const CFG = {
   chatE2eeV2: safe(process.env.CHAT_E2EE_V2 || '0') === '1',
   listeningReceiptsShadow:
     safe(process.env.LISTENING_RECEIPTS_SHADOW || '1') === '1',
+  listeningContextRewardsShadow:
+    safe(process.env.LISTENING_CONTEXT_REWARDS_SHADOW || '1') === '1',
   favoriteRewardsShadow:
     safe(process.env.FAVORITE_REWARDS_SHADOW || '1') === '1',
   backupRewardsShadow:
@@ -458,6 +460,54 @@ const ACHIEVEMENT_REWARD_CATALOG = Object.freeze([
     xpBase: 20,
     xpMultiplier: 1.5
   }),
+  {
+    id: 'quality_snob',
+    metric: 'hiFullPlays',
+    channel: 'listening_context',
+    target: 10,
+    amount: 30,
+    validatorVersion: 1
+  },
+  {
+    id: 'early_bird',
+    metric: 'earlyFullPlays',
+    channel: 'listening_context',
+    target: 10,
+    amount: 50,
+    validatorVersion: 1
+  },
+  {
+    id: 'night_owl',
+    metric: 'nightFullPlays',
+    channel: 'listening_context',
+    target: 10,
+    amount: 50,
+    validatorVersion: 1
+  },
+  {
+    id: 'weekend_warrior',
+    metric: 'weekendValidPlays',
+    channel: 'listening_context',
+    target: 10,
+    amount: 100,
+    validatorVersion: 1
+  },
+  {
+    id: 'use_shuffle_5',
+    metric: 'shuffleFullPlays',
+    channel: 'listening_context',
+    target: 5,
+    amount: 50,
+    validatorVersion: 1
+  },
+  {
+    id: 'exact_time_11_11',
+    metric: 'exactStart1111',
+    channel: 'listening_context',
+    target: 1,
+    amount: 300,
+    validatorVersion: 1
+  },
   ...[...LISTEN_ALBUM_TRACKS.keys()].map(album => ({
     id: `album_complete_${album}`,
     metric: 'albumComplete',
@@ -4028,6 +4078,37 @@ function listenTrackFromCatalog(trackUid) {
   return track;
 }
 
+function normalizeListenQuality(value) {
+  const quality = safe(value).toLowerCase();
+  return ['hi', 'lo'].includes(quality)
+    ? quality
+    : '';
+}
+
+function normalizeTimezoneOffsetMin(value) {
+  return Math.max(
+    -840,
+    Math.min(
+      840,
+      Math.round(num(value))
+    )
+  );
+}
+
+function listenLocalParts(timestamp, timezoneOffsetMin = 0) {
+  const localTimestamp =
+    num(timestamp) -
+    normalizeTimezoneOffsetMin(timezoneOffsetMin) * 60000;
+  const date = new Date(localTimestamp);
+
+  return {
+    hour: date.getUTCHours(),
+    minute: date.getUTCMinutes(),
+    weekday: date.getUTCDay(),
+    dayKey: date.toISOString().slice(0, 10)
+  };
+}
+
 function normalizeListenSession(raw = {}) {
   return {
     version: LISTEN_RECEIPT_VERSION,
@@ -4041,7 +4122,12 @@ function normalizeListenSession(raw = {}) {
       Math.min(7200, num(raw.duration))
     ),
     variant: sanitizeId(raw.variant || 'audio', 40),
-    quality: sanitizeId(raw.quality || '', 20),
+    quality: normalizeListenQuality(raw.quality),
+    timezoneOffsetMin:
+      normalizeTimezoneOffsetMin(raw.timezoneOffsetMin),
+    shuffle: raw.shuffle === true,
+    favoritesOnly: raw.favoritesOnly === true,
+    favoriteAtStart: raw.favoriteAtStart === true,
     status: sanitizeId(raw.status || 'active', 30),
     startedAt: num(raw.startedAt),
     lastHeartbeatAt: num(raw.lastHeartbeatAt),
@@ -4104,6 +4190,30 @@ function normalizeAchievementProgress(raw = {}, playerId = '') {
     backupSaves: Math.max(
       0,
       Math.floor(num(raw.backupSaves))
+    ),
+    hiFullPlays: Math.max(
+      0,
+      Math.floor(num(raw.hiFullPlays))
+    ),
+    earlyFullPlays: Math.max(
+      0,
+      Math.floor(num(raw.earlyFullPlays))
+    ),
+    nightFullPlays: Math.max(
+      0,
+      Math.floor(num(raw.nightFullPlays))
+    ),
+    weekendValidPlays: Math.max(
+      0,
+      Math.floor(num(raw.weekendValidPlays))
+    ),
+    shuffleFullPlays: Math.max(
+      0,
+      Math.floor(num(raw.shuffleFullPlays))
+    ),
+    exactStart1111: Math.max(
+      0,
+      Math.floor(num(raw.exactStart1111))
     ),
     uniqueTracks: Object.fromEntries(
       Object.entries(uniqueTracks)
@@ -4182,6 +4292,11 @@ function publicListenSession(session) {
     sessionId: data.sessionId,
     trackUid: data.trackUid,
     status: data.status,
+    quality: data.quality,
+    timezoneOffsetMin: data.timezoneOffsetMin,
+    shuffle: data.shuffle,
+    favoritesOnly: data.favoritesOnly,
+    favoriteAtStart: data.favoriteAtStart,
     startedAt: data.startedAt,
     lastHeartbeatAt: data.lastHeartbeatAt,
     completedAt: data.completedAt,
@@ -4207,6 +4322,12 @@ function publicAchievementProgress(progress) {
     fullPlays: data.fullPlays,
     totalSec: data.totalSec,
     backupSaves: data.backupSaves,
+    hiFullPlays: data.hiFullPlays,
+    earlyFullPlays: data.earlyFullPlays,
+    nightFullPlays: data.nightFullPlays,
+    weekendValidPlays: data.weekendValidPlays,
+    shuffleFullPlays: data.shuffleFullPlays,
+    exactStart1111: data.exactStart1111,
     uniqueTracks: Object.keys(data.uniqueTracks).length,
     maxOneTrackFull: Math.max(
       0,
@@ -4400,6 +4521,29 @@ async function applyListenReceiptProgress(receipt) {
       ...progress.perTrackFull
     };
     const activeDays = [...progress.activeDays];
+    const localStart = listenLocalParts(
+      receipt.startedAt,
+      receipt.timezoneOffsetMin
+    );
+    const localMinute =
+      localStart.hour * 60 + localStart.minute;
+    const earlyFull =
+      receipt.full &&
+      localMinute >= 300 &&
+      localMinute <= 539;
+    const nightFull =
+      receipt.full &&
+      localMinute >= 120 &&
+      localMinute <= 270;
+    const weekendValid =
+      receipt.valid &&
+      (
+        localStart.weekday === 0 ||
+        localStart.weekday === 6
+      );
+    const exactStart1111 =
+      receipt.valid &&
+      localMinute === 671;
 
     if (receipt.valid) {
       uniqueTracks[receipt.trackUid] =
@@ -4429,6 +4573,36 @@ async function applyListenReceiptProgress(receipt) {
       totalSec:
         progress.totalSec +
         (receipt.valid ? receipt.observedSec : 0),
+      hiFullPlays:
+        progress.hiFullPlays +
+        (
+          receipt.full &&
+          receipt.quality === 'hi'
+            ? 1
+            : 0
+        ),
+      earlyFullPlays:
+        progress.earlyFullPlays +
+        (earlyFull ? 1 : 0),
+      nightFullPlays:
+        progress.nightFullPlays +
+        (nightFull ? 1 : 0),
+      weekendValidPlays:
+        progress.weekendValidPlays +
+        (weekendValid ? 1 : 0),
+      shuffleFullPlays:
+        progress.shuffleFullPlays +
+        (
+          receipt.full &&
+          receipt.shuffle === true
+            ? 1
+            : 0
+        ),
+      exactStart1111:
+        Math.max(
+          progress.exactStart1111,
+          exactStart1111 ? 1 : 0
+        ),
       uniqueTracks,
       perTrackFull,
       activeDays,
@@ -4502,6 +4676,11 @@ async function finalizeListenSession(session) {
     acceptedHeartbeats: data.acceptedHeartbeats,
     rejectedHeartbeats: data.rejectedHeartbeats,
     completionReason: data.completionReason,
+    quality: data.quality,
+    timezoneOffsetMin: data.timezoneOffsetMin,
+    shuffle: data.shuffle,
+    favoritesOnly: data.favoritesOnly,
+    favoriteAtStart: data.favoriteAtStart,
     startedAt: data.startedAt,
     completedAt: data.completedAt,
     shadow: true,
@@ -4598,6 +4777,14 @@ async function actionListenSessionStart(event, body) {
   const deviceId =
     sanitizeId(body.deviceId, 120) ||
     'web';
+  const favoriteState = normalizeFavoriteState(
+    payload(await kvGet(
+      favoriteStateKey(playerId)
+    )),
+    playerId
+  );
+  const favoriteAtStart =
+    favoriteState.items?.[track.uid]?.status === 'active';
   const key = listenActiveKey(
     playerId,
     deviceId
@@ -4634,6 +4821,10 @@ async function actionListenSessionStart(event, body) {
       duration: track.duration,
       variant: body.variant || 'audio',
       quality: body.quality || '',
+      timezoneOffsetMin: body.timezoneOffsetMin,
+      shuffle: body.shuffle === true,
+      favoritesOnly: body.favoritesOnly === true,
+      favoriteAtStart,
       status: 'active',
       startedAt: at,
       lastHeartbeatAt: at,
@@ -5518,6 +5709,30 @@ function achievementMetricValue(
     );
   }
 
+  if (reward.metric === 'hiFullPlays') {
+    return progress.hiFullPlays;
+  }
+
+  if (reward.metric === 'earlyFullPlays') {
+    return progress.earlyFullPlays;
+  }
+
+  if (reward.metric === 'nightFullPlays') {
+    return progress.nightFullPlays;
+  }
+
+  if (reward.metric === 'weekendValidPlays') {
+    return progress.weekendValidPlays;
+  }
+
+  if (reward.metric === 'shuffleFullPlays') {
+    return progress.shuffleFullPlays;
+  }
+
+  if (reward.metric === 'exactStart1111') {
+    return progress.exactStart1111;
+  }
+
   if (reward.metric === 'albumComplete') {
     const tracks = LISTEN_ALBUM_TRACKS.get(
       reward.album
@@ -5541,6 +5756,10 @@ function achievementRewardEnabled(reward) {
 
   if (reward.channel === 'backup') {
     return !CFG.backupRewardsShadow;
+  }
+
+  if (reward.channel === 'listening_context') {
+    return !CFG.listeningContextRewardsShadow;
   }
 
   return !CFG.listeningReceiptsShadow;
@@ -5646,6 +5865,7 @@ async function reconcileAchievementRewards(
   return {
     enabled:
       !CFG.listeningReceiptsShadow ||
+      !CFG.listeningContextRewardsShadow ||
       !CFG.favoriteRewardsShadow ||
       !CFG.backupRewardsShadow,
     grants,
@@ -8865,6 +9085,19 @@ exports.handler = async event => {
             CFG.favoriteRewardsShadow,
           catalogTracks:
             LISTEN_TRACK_CATALOG.size
+        },
+        listeningContextRewards: {
+          enabled: true,
+          shadow:
+            CFG.listeningContextRewardsShadow,
+          metrics: [
+            'hiFullPlays',
+            'earlyFullPlays',
+            'nightFullPlays',
+            'weekendValidPlays',
+            'shuffleFullPlays',
+            'exactStart1111'
+          ]
         },
         backupRewards: {
           enabled: true,
