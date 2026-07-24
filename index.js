@@ -4373,6 +4373,13 @@ function normalizeAchievementProgress(raw = {}, playerId = '') {
         .map(value => sanitizeId(value, 20))
         .filter(value => /^\d{4}-\d{2}-\d{2}$/.test(value))
     )].sort().slice(-400),
+    activeDaysLocal: [...new Set(
+      (Array.isArray(raw.activeDaysLocal)
+        ? raw.activeDaysLocal
+        : [])
+        .map(value => sanitizeId(value, 20))
+        .filter(value => /^\d{4}-\d{2}-\d{2}$/.test(value))
+    )].sort().slice(-400),
     receiptIds: [...new Set(
       (Array.isArray(raw.receiptIds)
         ? raw.receiptIds
@@ -4477,8 +4484,12 @@ function publicAchievementProgress(progress) {
       0,
       ...Object.values(data.perTrackFull)
     ),
-    streak: calculateServerStreak(data.activeDays),
-    activeDays: data.activeDays.length,
+    streak: calculateServerStreak(
+      data.activeDaysLocal
+    ),
+    activeDays: data.activeDaysLocal.length,
+    legacyUtcActiveDays: data.activeDays.length,
+    streakDayMode: 'local_session_start_v1',
     receipts: data.receiptIds.length,
     updatedAt: data.updatedAt
   };
@@ -4676,6 +4687,9 @@ async function applyListenReceiptProgress(receipt) {
       ...progress.perTrackFull
     };
     const activeDays = [...progress.activeDays];
+    const activeDaysLocal = [
+      ...progress.activeDaysLocal
+    ];
     const favoriteOrderedByDevice = {
       ...progress.favoriteOrderedByDevice
     };
@@ -4792,8 +4806,19 @@ async function applyListenReceiptProgress(receipt) {
         uniqueTracks[receipt.trackUid] ||
         receipt.completedAt;
 
+      // Legacy UTC completion day сохраняется только для совместимости.
       const day = utcDayKey(receipt.completedAt);
       if (!activeDays.includes(day)) activeDays.push(day);
+
+      // Канонический streak использует локальный день старта,
+      // замороженный в versioned listening context.
+      if (
+        contextValid &&
+        localStart?.dayKey &&
+        !activeDaysLocal.includes(localStart.dayKey)
+      ) {
+        activeDaysLocal.push(localStart.dayKey);
+      }
     }
 
     if (receipt.full) {
@@ -4856,6 +4881,7 @@ async function applyListenReceiptProgress(receipt) {
       uniqueTracks,
       perTrackFull,
       activeDays,
+      activeDaysLocal,
       receiptIds: [
         ...progress.receiptIds,
         receipt.receiptId
@@ -5950,7 +5976,9 @@ function achievementMetricValue(
   }
 
   if (reward.metric === 'streak') {
-    return calculateServerStreak(progress.activeDays);
+    return calculateServerStreak(
+      progress.activeDaysLocal
+    );
   }
   if (reward.metric === 'favCount') {
     return favoriteRewardCount(
@@ -9376,6 +9404,9 @@ exports.handler = async event => {
           enabled: true,
           shadow:
             CFG.listeningContextRewardsShadow,
+          contextVersion: 1,
+          streakDayMode:
+            'local_session_start_v1',
           metrics: [
             'hiFullPlays',
             'earlyFullPlays',
