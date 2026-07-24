@@ -54,6 +54,8 @@ const CFG = {
     safe(process.env.FAVORITE_REWARDS_SHADOW || '1') === '1',
   backupRewardsShadow:
     safe(process.env.BACKUP_REWARDS_SHADOW || '1') === '1',
+  featureRewardsShadow:
+    safe(process.env.FEATURE_REWARDS_SHADOW || '1') === '1',
   backupReceiptSecret:
     safe(process.env.BACKUP_RECEIPT_SECRET || ''),
   listenHeartbeatMinMs: Math.max(
@@ -540,6 +542,22 @@ const ACHIEVEMENT_REWARD_CATALOG = Object.freeze([
     amount: 300,
     validatorVersion: 1
   },
+  {
+    id: 'feature_lyrics',
+    metric: 'lyricsUsed',
+    channel: 'feature',
+    target: 1,
+    amount: 15,
+    validatorVersion: 1
+  },
+  ...buildScaledRewards({
+    id: 'sleep_timer',
+    metric: 'sleepTimerTriggers',
+    channel: 'feature',
+    targets: [1, 5, 10, 50],
+    xpBase: 20,
+    xpMultiplier: 1.5
+  }),
   ...[...LISTEN_ALBUM_TRACKS.keys()].map(album => ({
     id: `album_complete_${album}`,
     metric: 'albumComplete',
@@ -4427,6 +4445,14 @@ function normalizeAchievementProgress(raw = {}, playerId = '') {
       0,
       Math.floor(num(raw.backupSaves))
     ),
+    lyricsUsed: Math.max(
+      0,
+      Math.min(1, Math.floor(num(raw.lyricsUsed)))
+    ),
+    sleepTimerTriggers: Math.max(
+      0,
+      Math.floor(num(raw.sleepTimerTriggers))
+    ),
     hiFullPlays: Math.max(
       0,
       Math.floor(num(raw.hiFullPlays))
@@ -4536,6 +4562,13 @@ function normalizeAchievementProgress(raw = {}, playerId = '') {
         .map(value => sanitizeId(value, 120))
         .filter(Boolean)
     )].slice(-1000),
+    featureReceiptIds: [...new Set(
+      (Array.isArray(raw.featureReceiptIds)
+        ? raw.featureReceiptIds
+        : [])
+        .map(value => sanitizeId(value, 160))
+        .filter(Boolean)
+    )].slice(-2000),
     updatedAt: num(raw.updatedAt)
   };
 }
@@ -4626,6 +4659,8 @@ function publicAchievementProgress(progress) {
     fullPlays: data.fullPlays,
     totalSec: data.totalSec,
     backupSaves: data.backupSaves,
+    lyricsUsed: data.lyricsUsed,
+    sleepTimerTriggers: data.sleepTimerTriggers,
     hiFullPlays: data.hiFullPlays,
     earlyFullPlays: data.earlyFullPlays,
     nightFullPlays: data.nightFullPlays,
@@ -5209,6 +5244,88 @@ async function applyListenReceiptProgress(receipt) {
 
   throw new Error('achievement_progress_conflict');
 }
+async function applyVerifiedFeatureProgress(playerId, {
+  receiptId,
+  field,
+  increment = 0,
+  value = 0
+} = {}) {
+  const cleanReceiptId = sanitizeId(receiptId, 160);
+  const allowedFields = new Set([
+    'lyricsUsed',
+    'sleepTimerTriggers'
+  ]);
+
+  if (!cleanReceiptId || !allowedFields.has(field)) {
+    throw new Error('feature_progress_invalid');
+  }
+
+  const key = achievementProgressKey(playerId);
+
+  for (let attempt = 0; attempt < 10; attempt++) {
+    let row = await kvGet(key);
+
+    if (!row) {
+      try {
+        await kvInsert({
+          pk: key,
+          type: 'achievementProgress',
+          owner: playerId,
+          data: normalizeAchievementProgress({}, playerId)
+        });
+      } catch {}
+
+      row = await kvGet(key);
+      if (!row) continue;
+    }
+
+    const progress = normalizeAchievementProgress(
+      payload(row),
+      playerId
+    );
+
+    if (progress.featureReceiptIds.includes(cleanReceiptId)) {
+      return {
+        duplicate: true,
+        progress
+      };
+    }
+
+    const current = Math.max(
+      0,
+      Math.floor(num(progress[field]))
+    );
+    const nextValue = increment > 0
+      ? current + Math.floor(increment)
+      : Math.max(current, Math.floor(num(value)));
+
+    const next = normalizeAchievementProgress({
+      ...progress,
+      [field]: nextValue,
+      featureReceiptIds: [
+        ...progress.featureReceiptIds,
+        cleanReceiptId
+      ],
+      updatedAt: now()
+    }, playerId);
+
+    if (!await kvCompareAndPut({
+      row,
+      type: 'achievementProgress',
+      owner: playerId,
+      data: next
+    })) {
+      continue;
+    }
+
+    return {
+      duplicate: false,
+      progress: next
+    };
+  }
+
+  throw new Error('feature_progress_conflict');
+}
 
 async function finalizeListenSession(session) {
   const data = normalizeListenSession(session);
@@ -5704,6 +5821,419 @@ async function actionListenSessionComplete(event, body) {
   }
 
   throw new Error('listen_session_complete_conflict');
+}
+const SLEEP_TIMER_RETENTION_MS =
+  90 * 24 * 60 * 60 * 1000;
+const SLEEP_TIMER_MAX_MINUTES = 720;
+const SLEEP_TIMER_EARLY_TOLERANCE_MS = 5000;
+const SLEEP_TIMER_COMPLETION_GRACE_MS =
+  5 * 60 * 1000;
+
+function sleepTimerKey(playerId, timerId) {
+  return === timer.deviceId &&
+      session.status === 'active'
+    ) {
+      total += Math.max(
+        0,
+        Math.floor(session.observedMs / 1000) -
+          timer.baselineObservedSec
+      );
+    }
+  }
+
+  return total;
+}
+async function actionSleepTimerStart(event, body) {
+  const { playerId } = await requirePlayer(event, body);
+
+  await enforceRateLimit({
+    scope: 'sleep_timer_start',
+    actor: playerId,
+    limit: 30,
+    windowMs: 60 * 60 * 1000
+  });
+
+  const timerId = sanitizeId(body.timerId, 120);
+  const deviceId = sanitizeId(body.deviceId, 120);
+  const requestedMinutes = Math.floor(
+    num(body.requestedMinutes)
+  );
+
+  if (!timerId || !deviceId) {
+    throw new Error('sleep_timer_identity_required');
+  }
+
+  if (
+    requestedMinutes < 1 ||
+    requestedMinutes > SLEEP_TIMER_MAX_MINUTES
+  ) {
+    throw new Error('sleep_timer_duration_invalid');
+  }
+
+  const existingRow = await kvGet(
+    sleepTimerKey(playerId, timerId)
+  );
+  const existing = normalizeSleepTimer(
+    payload(existingRow)
+  );
+
+  if (
+    existingRow &&
+    existing.playerId === playerId
+  ) {
+    return {
+      ok: true,
+      duplicate: true,
+      timer: existing
+    };
+  }
+
+  const activePointer = payload(await kvGet(
+    sleepTimerActiveKey(playerId, deviceId)
+  ));
+
+  if (activePointer?.timerId) {
+    const previous = normalizeSleepTimer(
+      payload(await kvGet(
+        sleepTimerKey(
+          playerId,
+          activePointer.timerId
+        )
+      ))
+    );
+
+    await cancelStoredSleepTimer(
+      previous,
+      'replaced'
+    ).catch(() => null);
+  }
+
+  const activeSession = normalizeListenSession(
+    payload(await kvGet(
+      listenActiveKey(playerId, deviceId)
+    ))
+  );
+  const startedAt = now();
+  const deadlineAt =
+    startedAt + requestedMinutes * 60000;
+
+  const timer = normalizeSleepTimer({
+    timerId,
+    playerId,
+    deviceId,
+    status: 'active',
+    requestedMinutes,
+    startedAt,
+    deadlineAt,
+    baselineSessionId:
+      activeSession.status === 'active'
+        ? activeSession.sessionId
+        : '',
+    baselineObservedSec:
+      activeSession.status === 'active'
+        ? Math.floor(activeSession.observedMs / 1000)
+        : 0,
+    updatedAt: startedAt
+  });
+
+  await kvPut({
+    pk: sleepTimerKey(playerId, timerId),
+    type: 'sleepTimer',
+    owner: playerId,
+    expiresAt: deadlineAt + SLEEP_TIMER_RETENTION_MS,
+    data: timer
+  });
+
+  await kvPut({
+    pk: sleepTimerActiveKey(playerId, deviceId),
+    type: 'sleepTimerActive',
+    owner: playerId,
+    expiresAt: deadlineAt + SLEEP_TIMER_RETENTION_MS,
+    data: {
+      timerId,
+      playerId,
+      deviceId,
+      deadlineAt,
+      updatedAt: startedAt
+    }
+  });
+
+  return {
+    ok: true,
+    duplicate: false,
+    shadow: CFG.featureRewardsShadow,
+    timer
+  };
+}
+async function actionSleepTimerCancel(event, body) {
+  const { playerId } = await requirePlayer(event, body);
+  const timerId = sanitizeId(body.timerId, 120);
+  const deviceId = sanitizeId(body.deviceId, 120);
+
+  if (!timerId || !deviceId) {
+    throw new Error('sleep_timer_identity_required');
+  }
+
+  const row = await kvGet(
+    sleepTimerKey(playerId, timerId)
+  );
+  const timer = normalizeSleepTimer(payload(row));
+
+  if (!row) {
+    return {
+      ok: true,
+      canceled: false,
+      reason: 'sleep_timer_not_found'
+    };
+  }
+
+  if (
+    timer.playerId !== playerId ||
+    timer.deviceId !== deviceId
+  ) {
+    throw new Error('sleep_timer_identity_mismatch');
+  }
+
+  if (timer.status !== 'active') {
+    return {
+      ok: true,
+      duplicate: true,
+      canceled: timer.status === 'canceled',
+      timer
+    };
+  }
+
+  const canceled = await cancelStoredSleepTimer(
+    timer,
+    body.reason || 'user_cancel'
+  );
+
+  return {
+    ok: true,
+    duplicate: false,
+    canceled: true,
+    timer: canceled
+  };
+}
+async function actionSleepTimerComplete(event, body) {
+  const { playerId } = await requirePlayer(event, body);
+  const timerId = sanitizeId(body.timerId, 120);
+  const deviceId = sanitizeId(body.deviceId, 120);
+
+  if (!timerId || !deviceId) {
+    throw new Error('sleep_timer_identity_required');
+  }
+
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const row = await kvGet(
+      sleepTimerKey(playerId, timerId)
+    );
+    const timer = normalizeSleepTimer(payload(row));
+
+    if (!row) {
+      throw new Error('sleep_timer_not_found');
+    }
+
+    if (
+      timer.playerId !== playerId ||
+      timer.deviceId !== deviceId
+    ) {
+      throw new Error('sleep_timer_identity_mismatch');
+    }
+
+    if (timer.status === 'completed') {
+      const progress = normalizeAchievementProgress(
+        payload(await kvGet(
+          achievementProgressKey(playerId)
+        )),
+        playerId
+      );
+      const rewards = await reconcileAchievementRewards(
+        playerId,
+        progress
+      );
+
+      return {
+        ok: true,
+        duplicate: true,
+        receiptId: timer.receiptId,
+        timer,
+        shadow: CFG.featureRewardsShadow,
+        rewardsEnabled: !CFG.featureRewardsShadow,
+        rewards: rewards.grants,
+        wallet: publicShardWallet(rewards.wallet),
+        progress: publicAchievementProgress(progress)
+      };
+    }
+
+    if (timer.status !== 'active') {
+      throw new Error('sleep_timer_not_completable');
+    }
+
+    if (
+      now() <
+      timer.deadlineAt - SLEEP_TIMER_EARLY_TOLERANCE_MS
+    ) {
+      const error = new Error('sleep_timer_not_due');
+      error.httpStatus = 409;
+      throw error;
+    }
+
+    const observedListeningSec =
+      await getSleepTimerObservedSeconds(timer);
+    const requiredObservedSec = Math.max(
+      13,
+      Math.floor(
+        timer.requestedMinutes * 60 * 0.5
+      )
+    );
+
+    if (observedListeningSec < requiredObservedSec) {
+      const error = new Error(
+        'sleep_timer_observation_insufficient'
+      );
+      error.httpStatus = 409;
+      throw error;
+    }
+
+    const receiptId = `sleep_${hash([
+      playerId,
+      timerId
+    ].join(':')).slice(0, 40)}`;
+    const completedAt = now();
+
+    const completed = normalizeSleepTimer({
+      ...timer,
+      status: 'completed',
+      completedAt,
+      observedListeningSec,
+      receiptId,
+      updatedAt: completedAt
+    });
+
+    if (!await kvCompareAndPut({
+      row,
+      type: 'sleepTimer',
+      owner: playerId,
+      expiresAt:
+        timer.deadlineAt + SLEEP_TIMER_RETENTION_MS,
+      data: completed
+    })) {
+      continue;
+    }
+
+    const applied = await applyVerifiedFeatureProgress(
+      playerId,
+      {
+        receiptId,
+        field: 'sleepTimerTriggers',
+        increment: 1
+      }
+    );
+
+    const rewards = await reconcileAchievementRewards(
+      playerId,
+      applied.progress
+    );
+
+    return {
+      ok: true,
+      duplicate: applied.duplicate,
+      receiptId,
+      timer: completed,
+      requiredObservedSec,
+      observedListeningSec,
+      shadow: CFG.featureRewardsShadow,
+      rewardsEnabled: !CFG.featureRewardsShadow,
+      rewards: rewards.grants,
+      wallet: publicShardWallet(rewards.wallet),
+      progress: publicAchievementProgress(
+        applied.progress
+      )
+    };
+  }
+
+  throw new Error('sleep_timer_complete_conflict');
+}
+
+async function actionMusicFeatureUse(event, body) {
+  const { playerId } = await requirePlayer(event, body);
+
+  await enforceRateLimit({
+    scope: 'music_feature_use',
+    actor: playerId,
+    limit: 60,
+    windowMs: 60 * 60 * 1000
+  });
+
+  const feature = sanitizeId(body.feature, 40);
+  const sessionId = sanitizeId(body.sessionId, 120);
+  const trackUid = sanitizeId(body.trackUid, 160);
+
+  if (feature !== 'lyrics') {
+    throw new Error('music_feature_not_supported');
+  }
+
+  if (!sessionId || !trackUid) {
+    throw new Error('music_feature_session_required');
+  }
+
+  const resolved = await resolveListenSessionRow(
+    playerId,
+    sessionId
+  );
+  const session = resolved.session;
+
+  if (
+    !resolved.row ||
+    session.playerId !== playerId ||
+    session.sessionId !== sessionId ||
+    session.trackUid !== trackUid ||
+    !['active', 'completed'].includes(session.status)
+  ) {
+    throw new Error('music_feature_session_mismatch');
+  }
+
+  if (
+    session.acceptedHeartbeats < 1 ||
+    session.observedMs < 5000
+  ) {
+    const error = new Error('music_feature_observation_required');
+    error.httpStatus = 409;
+    throw error;
+  }
+
+  const receiptId = `feature_${hash([
+    playerId,
+    sessionId,
+    feature
+  ].join(':')).slice(0, 40)}`;
+
+  const applied = await applyVerifiedFeatureProgress(
+    playerId,
+    {
+      receiptId,
+      field: 'lyricsUsed',
+      value: 1
+    }
+  );
+
+  const rewards = await reconcileAchievementRewards(
+    playerId,
+    applied.progress
+  );
+
+  return {
+    ok: true,
+    duplicate: applied.duplicate,
+    feature,
+    receiptId,
+    shadow: CFG.featureRewardsShadow,
+    rewardsEnabled: !CFG.featureRewardsShadow,
+    rewards: rewards.grants,
+    wallet: publicShardWallet(rewards.wallet),
+    progress: publicAchievementProgress(applied.progress)
+  };
 }
 
 async function actionBackupAchievementReceipt(event, body) {
@@ -6323,6 +6853,14 @@ function achievementMetricValue(
     );
   }
 
+  if (reward.metric === 'lyricsUsed') {
+    return progress.lyricsUsed;
+  }
+
+  if (reward.metric === 'sleepTimerTriggers') {
+    return progress.sleepTimerTriggers;
+  }
+
   if (reward.metric === 'hiFullPlays') {
     return progress.hiFullPlays;
   }
@@ -6397,6 +6935,10 @@ function publicRewardChannels() {
     backup: {
       shadow: CFG.backupRewardsShadow,
       rewardsEnabled: !CFG.backupRewardsShadow
+    },
+    feature: {
+      shadow: CFG.featureRewardsShadow,
+      rewardsEnabled: !CFG.featureRewardsShadow
     }
   };
 }
@@ -6412,6 +6954,10 @@ function achievementRewardEnabled(reward) {
 
   if (reward.channel === 'listening_context') {
     return !CFG.listeningContextRewardsShadow;
+  }
+
+  if (reward.channel === 'feature') {
+    return !CFG.featureRewardsShadow;
   }
 
   return !CFG.listeningReceiptsShadow;
@@ -6519,7 +7065,8 @@ async function reconcileAchievementRewards(
       !CFG.listeningReceiptsShadow ||
       !CFG.listeningContextRewardsShadow ||
       !CFG.favoriteRewardsShadow ||
-      !CFG.backupRewardsShadow,
+      !CFG.backupRewardsShadow ||
+      !CFG.featureRewardsShadow,
     grants,
     wallet: latestWallet
   };
@@ -9647,6 +10194,14 @@ const ACTIONS = {
   listen_session_complete: actionListenSessionComplete,
   achievement_reward_status:
     actionAchievementRewardStatus,
+  music_feature_use:
+    actionMusicFeatureUse,
+  sleep_timer_start:
+    actionSleepTimerStart,
+  sleep_timer_complete:
+    actionSleepTimerComplete,
+  sleep_timer_cancel:
+    actionSleepTimerCancel,
   backup_achievement_receipt:
     actionBackupAchievementReceipt,
   rtc_config: actionRtcConfig,
@@ -9763,6 +10318,20 @@ exports.handler = async event => {
           metric: 'speedRunnerObservedMs',
           targetMs: 10800000,
           transitionGapMs: 30000
+        },
+        featureRewards: {
+          enabled: true,
+          shadow: CFG.featureRewardsShadow,
+          actions: [
+            'music_feature_use',
+            'sleep_timer_start',
+            'sleep_timer_complete',
+            'sleep_timer_cancel'
+          ],
+          metrics: [
+            'lyricsUsed',
+            'sleepTimerTriggers'
+          ]
         },
         backupRewards: {
           enabled: true,
