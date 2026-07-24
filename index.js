@@ -8903,7 +8903,15 @@ exports.handler = async event => {
       ) {
         status = 403;
       } else if (
-        /chat_revision_conflict|ranked_.*conflict|crypto_.*(?:missing|not_ready|conflict)|chat_e2ee_disabled/i.test(msg)
+        /listen_session_expired/i.test(msg)
+      ) {
+        status = 410;
+      } else if (
+        /listen_session_not_found/i.test(msg)
+      ) {
+        status = 404;
+      } else if (
+        /listen_session_(not_active|not_completable)|chat_revision_conflict|ranked_.*conflict|crypto_.*(?:missing|not_ready|conflict)|chat_e2ee_disabled/i.test(msg)
       ) {
         status = 409;
       } else if (
