@@ -3915,8 +3915,14 @@ const LISTEN_SESSION_RETENTION_MS =
   90 * 24 * 60 * 60 * 1000;
 const LISTEN_PROGRESS_RECEIPT_LIMIT = 5000;
 
-function listenActiveKey(playerId) {
-  return `listenActive:${sanitizeId(playerId, 96)}`;
+function listenActiveKey(playerId, deviceId = '') {
+  const base =
+    `listenActive:${sanitizeId(playerId, 96)}`;
+  const device = sanitizeId(deviceId, 120);
+
+  return device
+    ? `${base}:${device}`
+    : base;
 }
 
 function listenSessionKey(playerId, sessionId) {
@@ -3925,6 +3931,76 @@ function listenSessionKey(playerId, sessionId) {
     sanitizeId(playerId, 96),
     sanitizeId(sessionId, 120)
   ].join(':');
+}
+
+async function resolveListenSessionRow(
+  playerId,
+  sessionId
+) {
+  const historyKey = listenSessionKey(
+    playerId,
+    sessionId
+  );
+  const historyRow = await kvGet(historyKey);
+  const history = normalizeListenSession(
+    payload(historyRow)
+  );
+
+  if (
+    historyRow &&
+    history.playerId === playerId &&
+    history.sessionId === sessionId &&
+    history.deviceId
+  ) {
+    const activeKey = listenActiveKey(
+      playerId,
+      history.deviceId
+    );
+    const activeRow = await kvGet(activeKey);
+    const active = normalizeListenSession(
+      payload(activeRow)
+    );
+
+    if (
+      activeRow &&
+      active.playerId === playerId &&
+      active.sessionId === sessionId
+    ) {
+      return {
+        row: activeRow,
+        key: activeKey,
+        session: active,
+        active: true
+      };
+    }
+  }
+
+  // Совместимость с сессиями, созданными до per-device migration.
+  const legacyKey = listenActiveKey(playerId);
+  const legacyRow = await kvGet(legacyKey);
+  const legacy = normalizeListenSession(
+    payload(legacyRow)
+  );
+
+  if (
+    legacyRow &&
+    legacy.playerId === playerId &&
+    legacy.sessionId === sessionId
+  ) {
+    return {
+      row: legacyRow,
+      key: legacyKey,
+      session: legacy,
+      active: true
+    };
+  }
+
+  return {
+    row: historyRow,
+    key: historyKey,
+    session: history,
+    active: false
+  };
 }
 
 function listenReceiptKey(playerId, receiptId) {
@@ -4255,9 +4331,10 @@ function applyListenObservation(
     session: {
       ...current,
       lastHeartbeatAt: at,
-      lastPosition: accepted
-        ? position
-        : current.lastPosition,
+      // Подозрительный интервал не получает credit, но новая позиция
+      // становится baseline. Иначе один seek навсегда отравит сессию:
+      // каждый следующий heartbeat будет сравниваться со старой позицией.
+      lastPosition: position,
       observedMs: current.observedMs + creditMs,
       acceptedHeartbeats:
         current.acceptedHeartbeats +
@@ -4521,7 +4598,10 @@ async function actionListenSessionStart(event, body) {
   const deviceId =
     sanitizeId(body.deviceId, 120) ||
     'web';
-  const key = listenActiveKey(playerId);
+  const key = listenActiveKey(
+    playerId,
+    deviceId
+  );
 
   for (let attempt = 0; attempt < 10; attempt++) {
     let row = await kvGet(key);
@@ -4640,13 +4720,15 @@ async function actionListenSessionHeartbeat(event, body) {
     throw new Error('listen_session_required');
   }
 
-  const key = listenActiveKey(playerId);
-
   for (let attempt = 0; attempt < 10; attempt++) {
-    const row = await kvGet(key);
-    const session = normalizeListenSession(payload(row));
+    const resolved = await resolveListenSessionRow(
+      playerId,
+      sessionId
+    );
+    const { row, session } = resolved;
 
     if (
+      !resolved.active ||
       !row ||
       session.sessionId !== sessionId ||
       session.status !== 'active'
@@ -4712,20 +4794,14 @@ async function actionListenSessionComplete(event, body) {
     throw new Error('listen_session_required');
   }
 
-  const activeKey = listenActiveKey(playerId);
-  const historyKey = listenSessionKey(playerId, sessionId);
-
   for (let attempt = 0; attempt < 10; attempt++) {
-    const activeRow = await kvGet(activeKey);
-    const active = normalizeListenSession(payload(activeRow));
-    const useActive =
-      !!activeRow &&
-      active.sessionId === sessionId;
-
-    const row = useActive
-      ? activeRow
-      : await kvGet(historyKey);
-    const current = normalizeListenSession(payload(row));
+    const resolved = await resolveListenSessionRow(
+      playerId,
+      sessionId
+    );
+    const row = resolved.row;
+    const current = resolved.session;
+    const useActive = resolved.active;
 
     if (
       !row ||
@@ -4944,9 +5020,39 @@ async function actionBackupAchievementReceipt(event, body) {
 
 async function actionAchievementRewardStatus(event, body) {
   const { playerId } = await requirePlayer(event, body);
-  const active = normalizeListenSession(
-    payload(await kvGet(listenActiveKey(playerId)))
-  );
+
+  const [legacyActiveRow, deviceActiveRows] =
+    await Promise.all([
+      kvGet(listenActiveKey(playerId)),
+      kvPrefix(
+        `${listenActiveKey(playerId)}:`,
+        30
+      )
+    ]);
+
+  const activeSessions = [
+    legacyActiveRow,
+    ...deviceActiveRows
+  ]
+    .filter(Boolean)
+    .map(payload)
+    .map(normalizeListenSession)
+    .filter(session =>
+      session.playerId === playerId &&
+      session.status === 'active'
+    )
+    .filter((session, index, rows) =>
+      rows.findIndex(item =>
+        item.sessionId === session.sessionId
+      ) === index
+    )
+    .sort((left, right) =>
+      num(right.updatedAt) - num(left.updatedAt)
+    );
+
+  const active = activeSessions[0] ||
+    normalizeListenSession();
+
   const progress = normalizeAchievementProgress(
     payload(await kvGet(
       achievementProgressKey(playerId)
@@ -4991,6 +5097,8 @@ async function actionAchievementRewardStatus(event, body) {
       active.status === 'active'
         ? publicListenSession(active)
         : null,
+    activeSessions:
+      activeSessions.map(publicListenSession),
     grants: rewards.grants,
     wallet: publicShardWallet(rewards.wallet),
     favorites: {
